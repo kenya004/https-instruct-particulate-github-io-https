@@ -1,0 +1,32 @@
+# Local runtimes and scratch files
+/work/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+
+# Credentials and machine-specific settings
+.env
+.env.*
+!.env.example
+local_settings.py
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# Uploaded models, generated results, and model weights
+data/
+*.glb
+*.gltf
+*.npz
+*.npy
+*.ckpt
+*.pth
+*.pt
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/

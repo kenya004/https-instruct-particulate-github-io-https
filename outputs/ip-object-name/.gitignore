@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+ip_object_name/local_settings.py

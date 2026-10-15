@@ -1,0 +1,5 @@
+streamlit>=1.50,<2
+requests>=2.31,<3
+numpy>=1.25,<3
+trimesh>=4,<6
+plotly>=6,<8
