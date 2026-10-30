@@ -10,6 +10,7 @@ from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
 from . import core
+from .ccs_postprocessing import CCSOptions, refine_saved_segmentation
 from .planning import normalize_edit_request, plan_registered_model
 from .segmentation import ARTIFACTS, InstructParticulateSegmenter, SegmentationOptions, artifact_path, segment_registered_model
 from .store import ModelStore, error_details, utc_now, write_json
@@ -27,6 +28,10 @@ class SegmentRequest(BaseModel):
     query_batch_size: int = Field(default=2048, ge=128, le=8192)
     strict_face_postprocess: bool = True
     enforce_connectivity_per_part: bool = True
+
+
+class CCSRequest(BaseModel):
+    max_iterations: int = Field(default=5, ge=1, le=30, strict=True)
 
 
 def create_app(settings: core.Settings | None = None, *, models_root: Path | None = None, planner_model: str | None = None, segmentation_runner=None) -> FastAPI:
@@ -138,6 +143,19 @@ def create_app(settings: core.Settings | None = None, *, models_root: Path | Non
                 raise HTTPException(422, str(error)) from None
             except core.SetupError as error:
                 raise HTTPException(503, str(error)) from None
+            except Exception as error:
+                raise HTTPException(502, error_details(error)) from None
+
+    @app.post("/models/{model_id}/plans/{plan_id}/segmentations/{segmentation_id}/refine-ccs")
+    def refine_ccs(model_id: str, plan_id: str, segmentation_id: str, request: CCSRequest):
+        with locked_store() as store:
+            existing(store, model_id)
+            try:
+                return refine_saved_segmentation(store, model_id, plan_id, segmentation_id, CCSOptions(**request.model_dump()))
+            except FileNotFoundError:
+                raise HTTPException(404, "The source segmentation was not found.") from None
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
             except Exception as error:
                 raise HTTPException(502, error_details(error)) from None
 

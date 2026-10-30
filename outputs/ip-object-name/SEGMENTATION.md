@@ -10,6 +10,7 @@ cd ~/git/instruct-particulate
 source .venv/bin/activate
 bundle='/mnt/c/Users/mrkab/Documents/Codex/2026-09-26/https-instruct-particulate-github-io-https/outputs/ip-object-name'
 cp "$bundle/ip_object_name/segmentation.py" ip_object_name/
+cp "$bundle/ip_object_name/ccs_postprocessing.py" ip_object_name/
 cp "$bundle/ip_object_name/workflow_api.py" ip_object_name/
 cp "$bundle/requirements-object-name.txt" .
 pip install -r requirements-object-name.txt
@@ -29,6 +30,9 @@ Windows側は更新済みのStreamlitを再読み込みします。自動更新�
 2. パーツ構成を確認して「分割を実行」を押す。名前推定やパーツリスト生成は再実行しない。
 3. 分割結果を全体表示またはパーツ単独表示で確認する。
 4. GLB・NPZ・対応表JSONを取得する。
+
+分割後に「CCS補正を実行」を押すと、CPU上で面の所属を再判定できます。
+元の分割結果は残し、「補正前」「CCS補正後」を比較します。詳細は[CCS_POSTPROCESSING.md](CCS_POSTPROCESSING.md)を参照してください。
 
 推論はWSL側のGPUを利用します。初回のみ既存デモのモデル読み込み機能を使い、以後は重みを同じAPIプロセス内で再利用します。
 使用するテキストはプランの英語`name`です。`description`は記録用であり、モデルのテキスト条件には連結していません。

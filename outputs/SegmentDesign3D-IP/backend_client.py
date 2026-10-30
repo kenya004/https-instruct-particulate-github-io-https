@@ -49,6 +49,10 @@ class BackendClient:
     def segment(self, model_id: str, plan_id: str, options: dict) -> dict:
         return self._request("POST", f"/models/{model_id}/plans/{plan_id}/segment", json=options)
 
+    def refine_ccs(self, result: dict, options: dict) -> dict:
+        path = f"/models/{result['model_id']}/plans/{result['plan_id']}/segmentations/{result['segmentation_id']}/refine-ccs"
+        return self._request("POST", path, json=options)
+
     def download_artifact(self, result: dict, filename: str) -> bytes:
         if filename not in {"parts.glb", "parts.npz", "parts.json"}:
             raise BackendError("取得するファイル名を確認してください。")

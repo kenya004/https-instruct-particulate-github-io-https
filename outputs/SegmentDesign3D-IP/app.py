@@ -8,7 +8,7 @@ import streamlit as st
 
 from backend_client import BackendClient, BackendError
 from viewer import load_mesh_payloads, load_segmented_payloads, mesh_figure
-from workflow import input_identity, prepare_parts, segment_parts
+from workflow import input_identity, prepare_parts, refine_parts_ccs, segment_parts
 
 
 st.set_page_config(page_title="SegmentDesign3D IP", layout="wide")
@@ -49,6 +49,7 @@ elif state.get("input_identity") != input_identity(uploaded.name, content, up_di
 if state.get("plan") and state["plan"].get("edit_request") != request.strip():
     state.pop("plan", None)
     state.pop("segmentation", None)
+    state.pop("ccs_refinement", None)
 
 meshes = None
 preview_error = None
@@ -133,7 +134,30 @@ if plan:
                     st.error(str(error))
     segmentation = state.get("segmentation")
     if segmentation:
-        result, artifacts = segmentation["result"], segmentation["artifacts"]
+        with controls:
+            with st.expander("CCS補正設定"):
+                ccs_iterations = st.number_input("CCS最大反復数", min_value=1, max_value=30, value=5, step=1, key="ccs_iterations")
+            previous_ccs = state.get("ccs_refinement")
+            ccs_label = "CCS補正を実行"
+            if previous_ccs and not all(name in previous_ccs["artifacts"] for name in ("parts.glb", "parts.npz", "parts.json")):
+                ccs_label = "CCS結果の取得を再開"
+            if st.button(ccs_label, icon=":material/auto_fix_high:", width="stretch", key="refine_ccs"):
+                with st.status("CCS補正を開始しています", expanded=True) as status:
+                    try:
+                        refine_parts_ccs(state, BackendClient(base_url), options={"max_iterations": ccs_iterations}, progress=lambda label: status.update(label=label))
+                        status.update(label="CCS補正結果を取得しました", state="complete", expanded=False)
+                    except (BackendError, ValueError) as error:
+                        status.update(label="CCS補正を完了できませんでした", state="error", expanded=True)
+                        st.error(str(error))
+        refinement = state.get("ccs_refinement")
+        displayed = segmentation
+        if refinement:
+            with controls:
+                choice = st.radio("表示結果", ["補正前", "CCS補正後"], index=1, horizontal=True,
+                                  key=f"result_choice_{segmentation['result']['segmentation_id']}_{refinement['result']['segmentation_id']}")
+            if choice == "CCS補正後":
+                displayed = refinement
+        result, artifacts = displayed["result"], displayed["artifacts"]
         with controls:
             st.dataframe([
                 {"ID": part["part_id"], "パーツ": part["name"], "面数": part["face_count"], "水密": part["is_watertight"]}
@@ -142,6 +166,26 @@ if plan:
             st.caption(f"分割ID: {result['segmentation_id']}")
             for warning in result.get("warnings", []):
                 st.warning(warning)
+            if result.get("postprocessing", {}).get("method") == "ccs_face_centroids_v1":
+                diagnostics = result["postprocessing"]
+                reasons = {"unchanged": "変化なし", "max_iterations": "反復上限", "cycle_detected": "状態の繰り返し"}
+                st.metric("変更面数", diagnostics["changed_faces"])
+                st.caption(f"補正: {diagnostics['elapsed_seconds']:.3f}秒 / 保存を含む処理: {result['total_processing_seconds']:.3f}秒")
+                st.caption(f"終了理由: {reasons.get(diagnostics['stop_reason'], diagnostics['stop_reason'])}")
+                with st.expander("補正診断"):
+                    part_names = {part["part_id"]: part["name"] for part in result["parts"]}
+                    st.dataframe([
+                        {"パーツ": part_names[item["part_id"]], "面数（前）": item["faces_before"], "面数（後）": item["faces_after"],
+                         "連結成分（前）": item["components_before"], "連結成分（後）": item["components_after"]}
+                        for item in diagnostics["parts"]
+                    ], hide_index=True, width="stretch")
+                    skip_reasons = {"empty_part": "空パーツ", "no_points_in_overlap": "重複領域に代表点なし", "no_anchors_outside_overlap": "重複領域外の基準点なし", "would_empty_part": "パーツ消失を回避"}
+                    if diagnostics["skipped_pairs"]:
+                        st.dataframe([
+                            {"パーツ": " / ".join(part_names[index] for index in item["part_ids"]),
+                             "理由": skip_reasons.get(item["reason"], item["reason"]), "回数": item["occurrences"]}
+                            for item in diagnostics["skipped_pairs"]
+                        ], hide_index=True, width="stretch")
             for filename, mime, label in (("parts.glb", "model/gltf-binary", "GLB"), ("parts.npz", "application/octet-stream", "NPZ"), ("parts.json", "application/json", "対応表 JSON")):
                 if filename in artifacts:
                     st.download_button(label, artifacts[filename], file_name=f"{result['segmentation_id']}_{filename}", mime=mime, icon=":material/download:", key=f"download_{filename}")
@@ -161,6 +205,8 @@ if plan:
                         st.warning("このパーツに割り当てられた面はありません。")
                 except Exception as error:
                     st.error(f"分割結果を表示できません：{error}")
+            else:
+                st.caption("表示用GLBは未取得です。")
     else:
         with display:
             st.caption("未分割")

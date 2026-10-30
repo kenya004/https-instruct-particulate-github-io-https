@@ -18,6 +18,7 @@ bundle='/mnt/c/Users/mrkab/Documents/Codex/2026-09-26/https-instruct-particulate
 cp "$bundle/ip_object_name/planning.py" ip_object_name/
 cp "$bundle/ip_object_name/workflow_api.py" ip_object_name/
 cp "$bundle/ip_object_name/segmentation.py" ip_object_name/
+cp "$bundle/ip_object_name/ccs_postprocessing.py" ip_object_name/
 cp "$bundle/ip_object_name/part-plan-system-prompt.md" ip_object_name/
 cp "$bundle/requirements-object-name.txt" .
 pip install -r requirements-object-name.txt
@@ -97,6 +98,7 @@ LLMには、物体名から構成部品を考え、編集要求に応じて分�
 ただし、領域の網羅性・非重複性・接続関係の維持を幾何学的に検証する機能ではありません。
 パーツ構成の確認後、別ボタンからセグメンテーションを実行できます。
 配置手順、出力データ、制約は[SEGMENTATION.md](SEGMENTATION.md)を参照してください。
+分割後の任意のCCS補正と比較については[CCS_POSTPROCESSING.md](CCS_POSTPROCESSING.md)を参照してください。
 形状編集・接続位置の補正・関節種別の生成はまだ実装していません。
 
 ## 検証
