@@ -102,6 +102,8 @@ class InterfaceTests(unittest.TestCase):
                     app.button[0].click().run()
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.dataframe), 1)
+        self.assertEqual(app.dataframe[0].value["パーツ名"].tolist(), ["handle", "head"])
+        self.assertNotIn("分割用名称", app.dataframe[0].value.columns)
         self.assertEqual(len(app.get("plotly_chart")), 1)
         self.assertEqual(app.session_state["preparation"]["object_name"], "\u30ec\u30f3\u30c1")
         register.assert_called_once()

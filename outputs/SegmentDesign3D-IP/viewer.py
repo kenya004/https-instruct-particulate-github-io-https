@@ -20,12 +20,29 @@ def load_mesh_payloads(content: bytes) -> list[dict]:
         mesh.apply_transform(transform)
         face_sizes = np.full((len(mesh.faces), 1), 3, dtype=np.int64)
         meshes.append({
-            "name": str(node), "vertices": mesh.vertices.tolist(),
+            "name": str(node), "geometry_name": str(geometry_name), "vertices": mesh.vertices.tolist(),
             "faces": np.hstack((face_sizes, mesh.faces)).ravel().tolist(),
             "color": "#e28b3e",
         })
     if not meshes:
         raise ValueError("GLBに表示できるメッシュがありません。")
+    return meshes
+
+
+def load_segmented_payloads(content: bytes, manifest: dict) -> list[dict]:
+    meshes = load_mesh_payloads(content)
+    records = {part["geometry_name"]: part for part in manifest["parts"] if part["face_count"] > 0}
+    if len(meshes) != len(records):
+        raise ValueError("GLBとパーツ対応表のメッシュ数が一致しません。")
+    seen = set()
+    for mesh in meshes:
+        part = records.get(mesh["geometry_name"])
+        if part is None or mesh["geometry_name"] in seen or mesh["name"] != part["node_name"]:
+            raise ValueError("GLB内のメッシュとパーツIDが対応しません。")
+        if len(mesh["vertices"]) != part["vertex_count"] or len(mesh["faces"]) // 4 != part["face_count"]:
+            raise ValueError("GLBとパーツ対応表の形状情報が一致しません。")
+        seen.add(mesh["geometry_name"])
+        mesh.update(part_id=part["part_id"], name=part["name"], color=part["color"])
     return meshes
 
 
@@ -43,7 +60,7 @@ def iter_triangle_faces(faces):
         index += point_count + 1
 
 
-def mesh_figure(meshes: list[dict], *, up_dir: str, height: int = 430) -> go.Figure:
+def mesh_figure(meshes: list[dict], *, up_dir: str, height: int = 430, bounds=None) -> go.Figure:
     traces = []
     for mesh in meshes:
         points = np.asarray(mesh["vertices"], dtype=np.float64)
@@ -63,9 +80,15 @@ def mesh_figure(meshes: list[dict], *, up_dir: str, height: int = 430) -> go.Fig
     up = {"x": 0, "y": 0, "z": 0}
     up[up_dir[-1].lower()] = -1 if up_dir.startswith("-") else 1
     figure = go.Figure(traces)
+    axes = {name: dict(title=name.upper(), **axis) for name in ("x", "y", "z")}
+    if bounds is not None:
+        lower, upper = np.asarray(bounds)
+        padding = max(float((upper - lower).max()) * 0.05, 1e-6)
+        for index, name in enumerate(("x", "y", "z")):
+            axes[name]["range"] = [float(lower[index] - padding), float(upper[index] + padding)]
     figure.update_layout(
         height=height, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="white",
         uirevision=up_dir,
-        scene=dict(aspectmode="data", xaxis=dict(title="X", **axis), yaxis=dict(title="Y", **axis), zaxis=dict(title="Z", **axis), camera=dict(up=up)),
+        scene=dict(aspectmode="data", xaxis=axes["x"], yaxis=axes["y"], zaxis=axes["z"], camera=dict(up=up)),
     )
     return figure

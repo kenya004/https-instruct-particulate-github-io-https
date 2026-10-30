@@ -17,6 +17,7 @@ source .venv/bin/activate
 bundle='/mnt/c/Users/mrkab/Documents/Codex/2026-09-26/https-instruct-particulate-github-io-https/outputs/ip-object-name'
 cp "$bundle/ip_object_name/planning.py" ip_object_name/
 cp "$bundle/ip_object_name/workflow_api.py" ip_object_name/
+cp "$bundle/ip_object_name/segmentation.py" ip_object_name/
 cp "$bundle/ip_object_name/part-plan-system-prompt.md" ip_object_name/
 cp "$bundle/requirements-object-name.txt" .
 pip install -r requirements-object-name.txt
@@ -58,6 +59,7 @@ UIを再起動・再読込した場合、セッション情報が消えるため
 | `GET /models/{model_id}` | モデルID | 現在の登録情報 |
 | `POST /models/{model_id}/recognize` | モデルID | 推定名・登録情報 |
 | `POST /models/{model_id}/parts` | `{"edit_request": "編集要求"}` | パーツ構成 |
+| `POST /models/{model_id}/plans/{plan_id}/segment` | 推論設定のJSON（空オブジェクト可） | 分割結果・取得先URL |
 
 名前推定の失敗後に明示して再試行する場合は`/recognize?retry=true`を使用します。
 UIの再実行ボタンはこの指定を使います。処理が完了していればVLMを再呼び出ししません。
@@ -93,8 +95,9 @@ LLMには、物体名から構成部品を考え、編集要求に応じて分�
 全領域をいずれか一つのパーツへ割り当てる重複のない構成とし、未編集領域も含めます。
 形状変更後に接続先の位置を独立に調整する必要がある場合、そのパーツを分離する方針です。
 ただし、領域の網羅性・非重複性・接続関係の維持を幾何学的に検証する機能ではありません。
-このAPIはセグメンテーション・形状編集・関節種別の生成を実行しません。
-後段のInstruct-Particulateへの入力形式や、固定された構造部品の扱いは次の実装範囲です。
+パーツ構成の確認後、別ボタンからセグメンテーションを実行できます。
+配置手順、出力データ、制約は[SEGMENTATION.md](SEGMENTATION.md)を参照してください。
+形状編集・接続位置の補正・関節種別の生成はまだ実装していません。
 
 ## 検証
 

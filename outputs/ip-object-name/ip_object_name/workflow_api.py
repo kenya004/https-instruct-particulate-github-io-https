@@ -5,11 +5,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
 from . import core
 from .planning import normalize_edit_request, plan_registered_model
+from .segmentation import ARTIFACTS, InstructParticulateSegmenter, SegmentationOptions, artifact_path, segment_registered_model
 from .store import ModelStore, error_details, utc_now, write_json
 
 
@@ -20,7 +22,14 @@ class PlanRequest(BaseModel):
     edit_request: str = Field(min_length=1, max_length=4000)
 
 
-def create_app(settings: core.Settings | None = None, *, models_root: Path | None = None, planner_model: str | None = None) -> FastAPI:
+class SegmentRequest(BaseModel):
+    points_per_face: int = Field(default=1, ge=1, le=8)
+    query_batch_size: int = Field(default=2048, ge=128, le=8192)
+    strict_face_postprocess: bool = True
+    enforce_connectivity_per_part: bool = True
+
+
+def create_app(settings: core.Settings | None = None, *, models_root: Path | None = None, planner_model: str | None = None, segmentation_runner=None) -> FastAPI:
     import os
 
     app = FastAPI(title="Instruct-Particulate Preparation API", version="0.2.0")
@@ -28,6 +37,7 @@ def create_app(settings: core.Settings | None = None, *, models_root: Path | Non
     root = (models_root or app.state.settings.repo_root / "data" / "models").expanduser().resolve()
     app.state.models_root = root
     app.state.planner_model = planner_model or os.getenv("IP_PART_PLANNER_MODEL") or app.state.settings.model
+    app.state.segmentation_runner = segmentation_runner or InstructParticulateSegmenter(app.state.settings.repo_root)
 
     @contextmanager
     def locked_store():
@@ -115,6 +125,33 @@ def create_app(settings: core.Settings | None = None, *, models_root: Path | Non
                 raise HTTPException(503, str(error)) from None
             except core.VLMError as error:
                 raise HTTPException(502, error_details(error)) from None
+
+    @app.post("/models/{model_id}/plans/{plan_id}/segment")
+    def segment(model_id: str, plan_id: str, request: SegmentRequest):
+        with locked_store() as store:
+            existing(store, model_id)
+            try:
+                return segment_registered_model(store, model_id, plan_id, app.state.segmentation_runner, SegmentationOptions(**request.model_dump()))
+            except FileNotFoundError:
+                raise HTTPException(404, "The model or part plan was not found.") from None
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
+            except core.SetupError as error:
+                raise HTTPException(503, str(error)) from None
+            except Exception as error:
+                raise HTTPException(502, error_details(error)) from None
+
+    @app.get("/models/{model_id}/plans/{plan_id}/segmentations/{segmentation_id}/files/{filename}")
+    def download(model_id: str, plan_id: str, segmentation_id: str, filename: str):
+        with locked_store() as store:
+            existing(store, model_id)
+            try:
+                path = artifact_path(store, model_id, plan_id, segmentation_id, filename)
+            except FileNotFoundError:
+                raise HTTPException(404, "The segmentation artifact was not found.") from None
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
+            return FileResponse(path, media_type=ARTIFACTS[filename], filename=filename)
 
     return app
 

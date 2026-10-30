@@ -45,3 +45,18 @@ class BackendClient:
 
     def plan(self, model_id: str, edit_request: str) -> dict:
         return self._request("POST", f"/models/{model_id}/parts", json={"edit_request": edit_request})
+
+    def segment(self, model_id: str, plan_id: str, options: dict) -> dict:
+        return self._request("POST", f"/models/{model_id}/plans/{plan_id}/segment", json=options)
+
+    def download_artifact(self, result: dict, filename: str) -> bytes:
+        if filename not in {"parts.glb", "parts.npz", "parts.json"}:
+            raise BackendError("取得するファイル名を確認してください。")
+        path = f"/models/{result['model_id']}/plans/{result['plan_id']}/segmentations/{result['segmentation_id']}/files/{filename}"
+        try:
+            response = requests.request("GET", self.base_url + path, timeout=(10, 600))
+        except requests.RequestException as error:
+            raise BackendError("分割結果を取得できません。WSL側の起動状態を確認してください。") from error
+        if not response.ok:
+            raise BackendError(f"分割結果の取得に失敗しました（HTTP {response.status_code}）。")
+        return response.content

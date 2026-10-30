@@ -4,8 +4,8 @@
 既存の二列レイアウトとPlotlyによるメッシュ表示のコードを基に、必要な部分を別フォルダへ移して作成しました。
 元の`C:/Users/mrkab/GH_hops/SegmentDesign3D/SegmentDesign3D`のファイルは変更していません。
 
-現在の範囲は`GLB＋編集要求 → オブジェクト名推定 → パーツリスト作成`です。
-Rhino・Grasshopper・旧PARTFIELD APIは呼び出しません。スライダー編集やセグメンテーションもまだ実行しません。
+現在の範囲は`GLB＋編集要求 → オブジェクト名推定 → パーツリスト作成 → 確認 → 分割・表示`です。
+Rhino・Grasshopper・旧PARTFIELD APIは呼び出しません。スライダー編集や接続位置の補正は未実装です。
 
 ## 配置
 
@@ -26,7 +26,7 @@ source .venv/bin/activate
 export IP_OBJECT_NAME_MODEL=gemini-3.8-flash
 export IP_PART_PLANNER_MODEL=gemini-3.8-flash
 export BLENDER_BIN=/usr/bin/blender
-python -m uvicorn ip_object_name.workflow_api:app --host 0.0.0.0 --port 8004 --workers 1
+python -m uvicorn ip_object_name.workflow_api:app --host 127.0.0.1 --port 8004 --workers 1
 ```
 
 GeminiのAPIキーは、これまで設定したWSLの`local_settings.py`を使用します。
@@ -54,12 +54,17 @@ python -m venv .venv
 2. モデルの上方向を選ぶ。
 3. どのように編集したいかを文章で入力する。
 4. 「パーツ構成を作成」を押す。
-5. 物体名と、日本語表示名・分割用英語名称・編集対象を確認する。
+5. 物体名と、分割用の英語パーツ名・編集対象を確認する。UIのパーツ名にはInstruct-Particulateへ渡す`name`をそのまま使用します。
+6. 「分割を実行」を押す。初回はGPUへの重みロードが必要です。
+7. 分割結果の「表示パーツ」で全体・個別パーツを切り替える。
+8. GLB・NPZ・対応表JSONをダウンロードする。
 
 結果のJSONをダウンロードできます。元モデルと処理結果はWSL側の`data/models/<model_id>`に保存されます。
-Windows側のプレビューは元のGLBです。この段階では分割後の形状を表示しているわけではありません。
-要求文を変更すると前のパーツ表を非表示にし、再実行時にLLMへ新しい要求を渡します。
+上段の「入力モデル」は元のGLB、下段の「分割結果」は分割後の独立メッシュです。
+要求文を変更すると前のパーツ表と分割表示を非表示にし、再実行時にLLMへ新しい要求を渡します。
 同じモデル・向き・接続先なら登録と名前推定を再利用します。
+分割結果はWSLに保存され、API経由でWindows側へ取得します。WindowsからWSLのファイルパスを直接開く必要はありません。
+分割した面の保存形式と、後のPython編集への受け渡しは[SEGMENTATION.md](../ip-object-name/SEGMENTATION.md)を参照してください。
 
 ## 構成
 
@@ -67,7 +72,7 @@ Windows側のプレビューは元のGLBです。この段階では分割後の�
 app.py              入力・状態表示・パーツ表
 viewer.py           元の表示処理を基にしたGLBプレビュー
 backend_client.py   WSLのAPIへの通信
-workflow.py         登録→名前推定→パーツ構成の順序と状態管理
+workflow.py         登録→名前推定→パーツ構成と、確認後の分割・結果取得の状態管理
 ```
 
 ## テスト
