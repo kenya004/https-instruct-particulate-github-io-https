@@ -6,8 +6,13 @@ import os
 import numpy as np
 import streamlit as st
 
+from ui_modules import refresh_ui_modules
+
+refresh_ui_modules()
+
 from backend_client import BackendClient, BackendError
-from viewer import load_mesh_payloads, load_segmented_payloads, mesh_figure
+from part_editor import render_part_editor
+from viewer import load_mesh_payloads, load_segmented_payloads, mesh_figure, mesh_viewer_config
 from workflow import input_identity, prepare_parts, refine_parts_ccs, segment_parts
 
 
@@ -33,6 +38,7 @@ with st.sidebar:
 if "preparation" not in st.session_state:
     st.session_state.preparation = {}
 state = st.session_state.preparation
+editor_present = False
 left, right = st.columns([1, 1.65], gap="large")
 
 with left:
@@ -84,7 +90,7 @@ with left:
 with right:
     st.subheader("入力モデル")
     if meshes:
-        st.plotly_chart(mesh_figure(meshes, up_dir=up_dir), width="stretch", config={"displaylogo": False})
+        st.plotly_chart(mesh_figure(meshes, up_dir=up_dir), width="stretch", config=mesh_viewer_config())
     else:
         with st.container(height=430, border=False):
             st.caption("未選択")
@@ -200,13 +206,25 @@ if plan:
                     if visible:
                         vertices = np.concatenate([np.asarray(mesh["vertices"]) for mesh in split_meshes])
                         bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)])
-                        st.plotly_chart(mesh_figure(visible, up_dir=up_dir, bounds=bounds), width="stretch", key="segmentation_view", config={"displaylogo": False})
+                        st.plotly_chart(mesh_figure(visible, up_dir=up_dir, bounds=bounds), width="stretch", key="segmentation_view", config=mesh_viewer_config())
                     else:
                         st.warning("このパーツに割り当てられた面はありません。")
                 except Exception as error:
                     st.error(f"分割結果を表示できません：{error}")
             else:
                 st.caption("表示用GLBは未取得です。")
+        if "parts.npz" in artifacts:
+            st.divider()
+            st.subheader("パーツ編集")
+            st.caption("各パーツの倍率とX/Y/Z移動量を編集します。倍率1.00・移動量0が元の形状です。")
+            try:
+                render_part_editor(result, artifacts["parts.npz"], up_dir)
+                editor_present = True
+            except Exception as error:
+                st.error(f"編集データを読み込めません：{error}")
     else:
         with display:
             st.caption("未分割")
+
+if not editor_present:
+    st.session_state.pop("part_editing", None)

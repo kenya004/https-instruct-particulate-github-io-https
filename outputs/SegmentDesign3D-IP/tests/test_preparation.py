@@ -69,6 +69,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(vertices[:, 0].min(), 9.5)
         figure = mesh_figure(meshes, up_dir="-Y")
         self.assertEqual(figure.layout.scene.camera.up.y, -1)
+        self.assertEqual(figure.layout.scene.dragmode, "turntable")
         self.assertGreater(len(figure.data[0].i), 0)
 
     def test_backend_error_is_presented_without_traceback(self):

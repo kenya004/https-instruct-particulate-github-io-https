@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -18,15 +19,20 @@ from test_preparation import part_plan
 def segmentation_fixture():
     scene = trimesh.Scene()
     parts = []
+    arrays = {}
     for index in range(2):
         mesh = trimesh.creation.box()
         mesh.apply_translation([index * 2 + 10, 20, 30])
         name = f"part_{index:04d}"
+        arrays[f"{name}_vertices"] = mesh.vertices.copy()
+        arrays[f"{name}_faces"] = mesh.faces.copy()
         scene.add_geometry(mesh, geom_name=name, node_name=f"node_{name}")
         parts.append({**part_plan()["parts"][index], "geometry_name": name, "node_name": f"node_{name}",
                       "vertex_count": 8, "face_count": 12, "is_watertight": True, "color": ["#d77a35", "#168b83"][index]})
     result = {"model_id": "a" * 32, "plan_id": "b" * 32, "segmentation_id": "c" * 32, "status": "completed", "parts": parts, "warnings": []}
-    artifacts = {"parts.glb": scene.export(file_type="glb"), "parts.json": json.dumps(result).encode(), "parts.npz": b"test npz download"}
+    npz = io.BytesIO()
+    np.savez_compressed(npz, **arrays)
+    artifacts = {"parts.glb": scene.export(file_type="glb"), "parts.json": json.dumps(result).encode(), "parts.npz": npz.getvalue()}
     return result, artifacts
 
 
@@ -86,6 +92,7 @@ class SegmentationWorkflowTests(unittest.TestCase):
         self.assertEqual({mesh["name"] for mesh in meshes}, {"handle", "head"})
         self.assertEqual({mesh["color"] for mesh in meshes}, {"#d77a35", "#168b83"})
         figure = mesh_figure(meshes[:1], up_dir="+Y", bounds=[[9.5, 19.5, 29.5], [12.5, 20.5, 30.5]])
+        self.assertEqual(figure.layout.scene.dragmode, "turntable")
         self.assertEqual(len(figure.data), 1)
         self.assertGreater(figure.layout.scene.xaxis.range[1], 12.5)
         self.result["parts"][0]["geometry_name"] = "wrong"
@@ -119,7 +126,7 @@ class SegmentationInterfaceTests(unittest.TestCase):
         self.assertEqual(len(app.get("plotly_chart")), 2)
         self.assertEqual(app.dataframe[1].value["パーツ"].tolist(), ["handle", "head"])
         self.assertEqual(app.selectbox(key=f"visible_part_{'c' * 32}").options, ["全体", "0: handle", "1: head"])
-        self.assertEqual(len(app.get("download_button")), 4)
+        self.assertEqual(len(app.get("download_button")), 5)
         app.selectbox(key=f"visible_part_{'c' * 32}").set_value(0).run()
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(app.selectbox(key=f"visible_part_{'c' * 32}").value, 0)

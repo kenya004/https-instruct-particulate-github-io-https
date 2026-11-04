@@ -60,6 +60,10 @@ def iter_triangle_faces(faces):
         index += point_count + 1
 
 
+def mesh_viewer_config() -> dict:
+    return {"displaylogo": False, "modeBarButtonsToRemove": ["orbitRotation"]}
+
+
 def mesh_figure(meshes: list[dict], *, up_dir: str, height: int = 430, bounds=None) -> go.Figure:
     traces = []
     for mesh in meshes:
@@ -68,7 +72,7 @@ def mesh_figure(meshes: list[dict], *, up_dir: str, height: int = 430, bounds=No
         traces.append(go.Mesh3d(
             x=points[:, 0], y=points[:, 1], z=points[:, 2],
             i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2],
-            color=mesh["color"], name=mesh["name"], opacity=1.0, flatshading=False,
+            color=mesh["color"], facecolor=mesh.get("face_colors"), name=mesh["name"], opacity=1.0, flatshading=False,
             lighting=dict(ambient=0.45, diffuse=0.65, specular=0.08, roughness=0.85, fresnel=0.0),
             showlegend=False, hoverinfo="skip",
         ))
@@ -88,7 +92,7 @@ def mesh_figure(meshes: list[dict], *, up_dir: str, height: int = 430, bounds=No
             axes[name]["range"] = [float(lower[index] - padding), float(upper[index] + padding)]
     figure.update_layout(
         height=height, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="white",
-        uirevision=up_dir,
-        scene=dict(aspectmode="data", xaxis=axes["x"], yaxis=axes["y"], zaxis=axes["z"], camera=dict(up=up)),
+        uirevision=f"turntable:{up_dir}",
+        scene=dict(dragmode="turntable", aspectmode="data", xaxis=axes["x"], yaxis=axes["y"], zaxis=axes["z"], camera=dict(up=up)),
     )
     return figure
