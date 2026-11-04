@@ -18,6 +18,7 @@ bundle='/mnt/c/Users/mrkab/Documents/Codex/2026-09-26/https-instruct-particulate
 cp "$bundle/ip_object_name/planning.py" ip_object_name/
 cp "$bundle/ip_object_name/workflow_api.py" ip_object_name/
 cp "$bundle/ip_object_name/segmentation.py" ip_object_name/
+cp "$bundle/ip_object_name/connectivity.py" ip_object_name/
 cp "$bundle/ip_object_name/ccs_postprocessing.py" ip_object_name/
 cp "$bundle/ip_object_name/part-plan-system-prompt.md" ip_object_name/
 cp "$bundle/requirements-object-name.txt" .

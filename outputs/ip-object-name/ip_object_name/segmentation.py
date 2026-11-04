@@ -12,6 +12,7 @@ import numpy as np
 import trimesh
 
 from . import core
+from .connectivity import refine_edge_connectivity
 from .planning import PartPlanPrediction
 from .store import ModelStore, error_details, utc_now, write_json
 
@@ -113,13 +114,22 @@ class InstructParticulateSegmenter:
                     query_face_indices=np.asarray(query_faces, dtype=np.int64),
                     input_part_ids=np.arange(len(names), dtype=np.int32),
                     strict=options.strict_face_postprocess,
-                    enforce_connectivity_per_part=options.enforce_connectivity_per_part,
+                    # Replace upstream distance links with shared-edge topology
+                    # that recognizes exactly coincident GLB seam endpoints.
+                    enforce_connectivity_per_part=False,
                 )
+                if options.enforce_connectivity_per_part:
+                    labels, diagnostics["connectivity"] = refine_edge_connectivity(
+                        geometry.original_mesh, labels, len(names),
+                        point_part_probabilities=probabilities, query_face_indices=np.asarray(query_faces),
+                    )
                 diagnostics.update(device=str(device), checkpoint=str(app.checkpoint_path), query_points=len(query_faces))
             except torch.cuda.OutOfMemoryError as error:
                 raise RuntimeError("CUDA memory exhausted. Stop other GPU workloads and retry; query batch size can be reduced.") from error
             finally:
                 torch.cuda.empty_cache()
+        if len(names) == 1 and options.enforce_connectivity_per_part:
+            labels, diagnostics["connectivity"] = refine_edge_connectivity(geometry.original_mesh, labels, 1)
         # Upstream original_mesh is Z-up. Restore input-scene coordinates, not normalized coordinates.
         rotation = np.asarray(geometry.up_dir_rotation, dtype=np.float64)
         vertices = np.asarray(geometry.original_mesh.vertices, dtype=np.float64) @ rotation
@@ -127,7 +137,8 @@ class InstructParticulateSegmenter:
             input_to_z_up_rotation=rotation.tolist(), normalization_center=np.asarray(geometry.center).tolist(),
             normalization_scale=float(geometry.scale),
         )
-        for filename in ("app.py", "infer.py", "instruct_particulate/utils/inference_utils.py"):
+        for filename in ("app.py", "infer.py", "instruct_particulate/utils/inference_utils.py",
+                         "instruct_particulate/utils/postprocessing_utils.py"):
             source = self.repo_root / filename
             if source.is_file():
                 diagnostics.setdefault("upstream_source_sha256", {})[filename] = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -210,6 +221,11 @@ def segment_registered_model(store: ModelStore, model_id: str, plan_id: str, run
     try:
         partition = runner(source, [part["name"] for part in plan["parts"]], metadata["up_dir"], options)
         manifest = export_partition(partition, plan, run_dir, segmentation_id)
+        for item in partition.diagnostics.get("connectivity", {}).get("parts", []):
+            if item["components_after"] > 1:
+                manifest["warnings"].append(
+                    f"{plan['parts'][item['part_id']]['name']}: Edge共有でつながらない領域が{item['components_after']}個残っています。"
+                    "同位置の重複頂点は考慮済みです。独立領域や座標が一致しない継ぎ目を確認してください。")
         manifest["options"] = asdict(options)
         base = f"/models/{model_id}/plans/{plan_id}/segmentations/{segmentation_id}/files"
         manifest["files"] = {name: f"{base}/{name}" for name in ARTIFACTS}

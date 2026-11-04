@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from filelock import FileLock
 
 from ip_object_name import core
+from ip_object_name.connectivity import refine_edge_connectivity
 from ip_object_name.segmentation import InstructParticulateSegmenter, MeshPartition, SegmentationOptions, export_partition
 from ip_object_name.store import ModelStore, write_json
 from ip_object_name.workflow_api import create_app
@@ -161,6 +162,35 @@ class SegmentationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     export_partition(partition, self.plan, self.root / "bad", "d" * 32)
 
+    def test_unresolved_edge_components_are_reported_in_artifact_manifest(self):
+        self.partition.diagnostics["connectivity"] = {
+            "method": "shared_edge_connectivity_v2",
+            "parts": [{"part_id": 0, "components_after": 2}],
+        }
+        result = self.segment()
+        self.assertTrue(any("first: Edge共有" in warning for warning in result["warnings"]))
+        saved = self.client.get(result["files"]["parts.json"]).json()
+        self.assertEqual(saved["diagnostics"]["connectivity"], self.partition.diagnostics["connectivity"])
+
+    def test_coincident_edge_analysis_exports_original_arrays_and_both_component_counts(self):
+        vertices = self.mesh.vertices[self.mesh.faces].reshape(-1, 3)
+        faces = np.arange(len(vertices)).reshape(-1, 3)
+        exploded = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        labels, diagnostic = refine_edge_connectivity(exploded, np.zeros(len(faces), dtype=np.int32), 3)
+        self.runner.return_value = MeshPartition(vertices, faces, labels, {"connectivity": diagnostic})
+        result = self.segment()
+        self.assertFalse(any("Edge共有" in warning for warning in result["warnings"]))
+        item = result["diagnostics"]["connectivity"]["parts"][0]
+        self.assertEqual(item["vertex_id_components_after"], 12)
+        self.assertEqual(item["components_after"], 1)
+        with np.load(io.BytesIO(self.client.get(result["files"]["parts.npz"]).content), allow_pickle=False) as data:
+            np.testing.assert_array_equal(data["vertices"], vertices)
+            np.testing.assert_array_equal(data["faces"], faces)
+            np.testing.assert_array_equal(data["part_0000_source_vertex_indices"], np.arange(len(vertices)))
+        scene = trimesh.load(io.BytesIO(self.client.get(result["files"]["parts.glb"]).content), file_type="glb", process=False)
+        self.assertEqual(len(scene.geometry["part_0000"].vertices), len(vertices))
+        self.assertEqual(len(scene.geometry["part_0000"].faces), len(faces))
+
 
 class UpstreamAdapterTests(unittest.TestCase):
     def test_whole_object_partition_skips_gpu_inference(self):
@@ -205,6 +235,16 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertEqual(module.prepare_inference_batch_from_mesh.call_args.kwargs["joint_specs"], [])
         self.assertFalse(module.run_batched_model_inference.call_args.kwargs["decode_joint_parameters"])
         self.assertEqual(module.prepare_inference_batch_from_mesh.call_args.kwargs["link_names"], ["first", "second"])
+        self.assertFalse(module.decode_face_part_ids.call_args.kwargs["enforce_connectivity_per_part"])
+        self.assertEqual(result.diagnostics["connectivity"]["method"], "shared_edge_connectivity_v2")
+        self.assertTrue(result.diagnostics["connectivity"]["all_nonempty_parts_connected"])
+
+        with patch.dict(sys.modules, {"torch": torch}), patch("ip_object_name.segmentation.refine_edge_connectivity") as refine:
+            result = runner(Path("input.glb"), ["first", "second"], "+Y",
+                            SegmentationOptions(enforce_connectivity_per_part=False))
+        refine.assert_not_called()
+        np.testing.assert_array_equal(result.face_part_ids, np.arange(12) % 2)
+        self.assertNotIn("connectivity", result.diagnostics)
 
 
 if __name__ == "__main__":

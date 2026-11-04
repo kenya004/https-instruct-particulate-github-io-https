@@ -10,6 +10,7 @@ cd ~/git/instruct-particulate
 source .venv/bin/activate
 bundle='/mnt/c/Users/mrkab/Documents/Codex/2026-09-26/https-instruct-particulate-github-io-https/outputs/ip-object-name'
 cp "$bundle/ip_object_name/segmentation.py" ip_object_name/
+cp "$bundle/ip_object_name/connectivity.py" ip_object_name/
 cp "$bundle/ip_object_name/ccs_postprocessing.py" ip_object_name/
 cp "$bundle/ip_object_name/workflow_api.py" ip_object_name/
 cp "$bundle/requirements-object-name.txt" .
@@ -41,6 +42,7 @@ Windows側は更新済みのStreamlitを再読み込みします。自動更新�
 
 既定値は各面1点、推論バッチ2048、厳密な面ラベル後処理あり、パーツごとの連結強制ありです。
 「推論設定」で面ごとの点数・バッチサイズ・連結強制を変更できます。
+連結強制の仕様と既存環境への最小更新手順は[CONNECTIVITY.md](CONNECTIVITY.md)を参照してください。
 VRAM不足なら他のGPU処理を停止し、バッチサイズを512などへ下げて再試行してください。
 ただし、バッチサイズは全ての特徴計算のメモリを制限するものではなく、6GBでの全モデル動作を保証しません。
 
