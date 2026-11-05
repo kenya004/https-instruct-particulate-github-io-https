@@ -164,7 +164,7 @@ class SegmentationTests(unittest.TestCase):
 
     def test_unresolved_edge_components_are_reported_in_artifact_manifest(self):
         self.partition.diagnostics["connectivity"] = {
-            "method": "shared_edge_connectivity_v2",
+            "method": "shared_edge_connectivity_v4",
             "parts": [{"part_id": 0, "components_after": 2}],
         }
         result = self.segment()
@@ -190,7 +190,6 @@ class SegmentationTests(unittest.TestCase):
         scene = trimesh.load(io.BytesIO(self.client.get(result["files"]["parts.glb"]).content), file_type="glb", process=False)
         self.assertEqual(len(scene.geometry["part_0000"].vertices), len(vertices))
         self.assertEqual(len(scene.geometry["part_0000"].faces), len(faces))
-
 
 class UpstreamAdapterTests(unittest.TestCase):
     def test_whole_object_partition_skips_gpu_inference(self):
@@ -236,7 +235,8 @@ class UpstreamAdapterTests(unittest.TestCase):
         self.assertFalse(module.run_batched_model_inference.call_args.kwargs["decode_joint_parameters"])
         self.assertEqual(module.prepare_inference_batch_from_mesh.call_args.kwargs["link_names"], ["first", "second"])
         self.assertFalse(module.decode_face_part_ids.call_args.kwargs["enforce_connectivity_per_part"])
-        self.assertEqual(result.diagnostics["connectivity"]["method"], "shared_edge_connectivity_v2")
+        self.assertEqual(result.diagnostics["connectivity"]["method"], "shared_edge_connectivity_v4")
+        self.assertNotIn("boundary_regularization", result.diagnostics["connectivity"])
         self.assertTrue(result.diagnostics["connectivity"]["all_nonempty_parts_connected"])
 
         with patch.dict(sys.modules, {"torch": torch}), patch("ip_object_name.segmentation.refine_edge_connectivity") as refine:

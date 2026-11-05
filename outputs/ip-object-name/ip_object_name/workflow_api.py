@@ -10,6 +10,7 @@ from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
 from . import core
+from .boundary_postprocessing import refine_saved_boundary
 from .ccs_postprocessing import CCSOptions, refine_saved_segmentation
 from .planning import normalize_edit_request, plan_registered_model
 from .segmentation import ARTIFACTS, InstructParticulateSegmenter, SegmentationOptions, artifact_path, segment_registered_model
@@ -34,10 +35,14 @@ class CCSRequest(BaseModel):
     max_iterations: int = Field(default=5, ge=1, le=30, strict=True)
 
 
+class BoundaryRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+
 def create_app(settings: core.Settings | None = None, *, models_root: Path | None = None, planner_model: str | None = None, segmentation_runner=None) -> FastAPI:
     import os
 
-    app = FastAPI(title="Instruct-Particulate Preparation API", version="0.2.0")
+    app = FastAPI(title="Instruct-Particulate Preparation API", version="0.3.0")
     app.state.settings = settings or core.Settings.from_env()
     root = (models_root or app.state.settings.repo_root / "data" / "models").expanduser().resolve()
     app.state.models_root = root
@@ -143,6 +148,19 @@ def create_app(settings: core.Settings | None = None, *, models_root: Path | Non
                 raise HTTPException(422, str(error)) from None
             except core.SetupError as error:
                 raise HTTPException(503, str(error)) from None
+            except Exception as error:
+                raise HTTPException(502, error_details(error)) from None
+
+    @app.post("/models/{model_id}/plans/{plan_id}/segmentations/{segmentation_id}/refine-boundary")
+    def refine_boundary(model_id: str, plan_id: str, segmentation_id: str, request: BoundaryRequest):
+        with locked_store() as store:
+            existing(store, model_id)
+            try:
+                return refine_saved_boundary(store, model_id, plan_id, segmentation_id)
+            except FileNotFoundError:
+                raise HTTPException(404, "The source segmentation was not found.") from None
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
             except Exception as error:
                 raise HTTPException(502, error_details(error)) from None
 

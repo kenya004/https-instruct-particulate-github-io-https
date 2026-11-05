@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import heapq
 from itertools import combinations
+from math import fsum
 from time import perf_counter
 
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+
+BOUNDARY_METHOD = "two_internal_edges_boundary_gain_v2"
 
 
 def _edge_adjacency(faces):
@@ -40,6 +43,221 @@ def _groups(adjacency, labels):
     count, groups = connected_components(graph, directed=False)
     _, first = np.unique(groups, return_index=True)
     return count, groups, labels[first]
+
+
+def _regularize_boundary_faces(face_part_ids, num_parts, adjacency, adjacency_edges, areas, *, vertices):
+    """Prioritize boundary-edge count reduction, then boundary-length reduction.
+
+    Changes are sequential. A manifold face with fewer than two internal edges
+    has at most one same-part neighbor, so removing it cannot split the donor.
+    Every accepted change strictly reduces the total number of boundary edges.
+    """
+    started = perf_counter()
+    original = np.asarray(face_part_ids, dtype=np.int32)
+    labels = original.copy()
+    counts_before = np.bincount(labels, minlength=num_parts)
+    counts = counts_before.copy()
+    # Distinct edges matter: three faces incident on one edge do not count as
+    # two shared edges. Store neighbors separately for each canonical edge.
+    face_edges = [dict() for _ in labels]
+    edges, edge_ids = np.unique(adjacency_edges, axis=0, return_inverse=True)
+    lengths = np.linalg.norm(vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1)
+    if not np.isfinite(lengths).all():
+        raise ValueError("Boundary refinement requires finite edge lengths.")
+    edge_faces = [set() for _ in edges]
+    for (left, right), edge in zip(adjacency, edge_ids):
+        face_edges[left].setdefault(int(edge), set()).add(int(right))
+        face_edges[right].setdefault(int(edge), set()).add(int(left))
+        edge_faces[edge].update((int(left), int(right)))
+    nonmanifold = np.array([any(len(neighbors) > 1 for neighbors in edges.values())
+                            for edges in face_edges], dtype=bool)
+
+    def shared_edges(face):
+        support = {}
+        for neighbors in face_edges[face].values():
+            for part in {int(labels[neighbor]) for neighbor in neighbors}:
+                support[part] = support.get(part, 0) + 1
+        return support
+
+    def is_violation(face, support):
+        own = int(labels[face])
+        return support.get(own, 0) < 2 and any(part != own for part in support)
+
+    def proposal(face):
+        donor = int(labels[face])
+        support = shared_edges(face)
+        if not is_violation(face, support) or nonmanifold[face] or counts[donor] <= 1:
+            return None
+        sides = [(int(labels[next(iter(neighbors))]), float(lengths[edge]))
+                 for edge, neighbors in sorted(face_edges[face].items())]
+        candidates = []
+        for part, shared in support.items():
+            if part == donor or shared < 2:
+                continue
+            count_gain = shared - support.get(donor, 0)
+            length_gain = fsum(length if neighbor_part == part else -length if neighbor_part == donor else 0.0
+                               for neighbor_part, length in sides)
+            candidates.append((count_gain, length_gain, part))
+        return max(candidates, key=lambda item: (item[0], item[1], -item[2])) if candidates else None
+
+    def boundary_measure():
+        selected = [edge for edge, incident in enumerate(edge_faces)
+                    if len({int(labels[face]) for face in incident}) > 1]
+        return len(selected), fsum(float(lengths[edge]) for edge in selected)
+
+    def summary():
+        boundary, violations = np.zeros(num_parts, dtype=np.int64), np.zeros(num_parts, dtype=np.int64)
+        for face in range(len(labels)):
+            support = shared_edges(face)
+            own = int(labels[face])
+            boundary[own] += any(part != own for part in support)
+            violations[own] += is_violation(face, support)
+        return boundary, violations
+
+    boundary_before, violations_before = summary()
+    edge_count_before, length_before = boundary_measure()
+    queue, active, score_counts = [], {}, {}
+    versions = np.zeros(len(labels), dtype=np.int64)
+
+    def discard(face):
+        previous = active.pop(face, None)
+        if previous is not None:
+            score = previous[:2]
+            score_counts[score] -= 1
+            if not score_counts[score]:
+                del score_counts[score]
+
+    def refresh(face):
+        discard(face)
+        versions[face] += 1
+        move = proposal(face)
+        if move is not None:
+            gain, length_gain, recipient = move
+            active[face] = move
+            score_counts[move[:2]] = score_counts.get(move[:2], 0) + 1
+            heapq.heappush(queue, (-gain, -length_gain, face, recipient, int(versions[face])))
+
+    for face in range(len(labels)):
+        refresh(face)
+    transfers = {}
+    transfer_area = 0.0
+    count_gain_total = 0
+    tie_steps, max_tie = 0, 0
+    move_sample = []
+    assignments = 0
+    while queue:
+        _, _, face, recipient, version = heapq.heappop(queue)
+        if version != versions[face] or face not in active:
+            continue
+        move = proposal(face)
+        if move != active[face]:
+            refresh(face)
+            continue
+        gain, length_gain, recipient = move
+        ties = score_counts[move[:2]]
+        tie_steps += ties > 1
+        max_tie = max(max_tie, ties)
+        donor = int(labels[face])
+        discard(face)
+        versions[face] += 1
+        labels[face] = recipient
+        counts[donor] -= 1
+        counts[recipient] += 1
+        key = (donor, recipient)
+        record = transfers.setdefault(key, {"assignments": 0, "surface_area": 0.0})
+        record["assignments"] += 1
+        record["surface_area"] += float(areas[face])
+        transfer_area += float(areas[face])
+        assignments += 1
+        count_gain_total += gain
+        if len(move_sample) < 100:
+            move_sample.append({"face_index": face, "from_part_id": donor, "to_part_id": recipient,
+                                "edge_count_reduction": gain, "boundary_length_reduction": length_gain})
+        affected = {face}
+        for neighbors in face_edges[face].values():
+            affected.update(neighbors)
+        # The last-face guard is part-wide, including disconnected components.
+        if counts[donor] == 1:
+            affected.update(np.flatnonzero(labels == donor).tolist())
+        if counts[recipient] == 2:
+            affected.update(np.flatnonzero(labels == recipient).tolist())
+        for neighbor in sorted(affected):
+            refresh(neighbor)
+
+    boundary_after, violations_after = summary()
+    unresolved, reasons = [], {}
+    for face in range(len(labels)):
+        support = shared_edges(face)
+        if not is_violation(face, support):
+            continue
+        own = int(labels[face])
+        if nonmanifold[face]:
+            reason = "nonmanifold_edge"
+        elif counts[own] <= 1:
+            reason = "would_empty_part"
+        elif not any(part != own and edges >= 2 for part, edges in support.items()):
+            reason = "no_recipient_with_two_shared_edges"
+        else:
+            raise RuntimeError("An admissible boundary face remained after the queue emptied.")
+        unresolved.append(face)
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    _, _, before_parts = _groups(adjacency, original)
+    _, _, after_parts = _groups(adjacency, labels)
+    components_before = np.bincount(before_parts, minlength=num_parts)
+    components_after = np.bincount(after_parts, minlength=num_parts)
+    if np.any((counts_before > 0) & (counts == 0)) or np.any(components_after > components_before):
+        raise RuntimeError("Boundary regularization must not empty or split a part.")
+    edge_count_after, length_after = boundary_measure()
+    if edge_count_before - edge_count_after != count_gain_total:
+        raise RuntimeError("Every boundary transfer must strictly reduce the boundary-edge count.")
+    changed = labels != original
+    return labels, {
+        "method": BOUNDARY_METHOD,
+        "priority": "maximum boundary-edge count reduction, then maximum boundary-length reduction",
+        "tie_break": "source face index, then recipient part ID",
+        "order_dependence_possible": True, "priority_tie_steps": tie_steps,
+        "max_equal_priority_candidates": max_tie,
+        "move_sample": move_sample, "move_sample_limit": 100, "move_sample_truncated": assignments > len(move_sample),
+        "boundary_edges_before": edge_count_before, "boundary_edges_after": edge_count_after,
+        "boundary_edge_reduction": edge_count_before - edge_count_after,
+        "boundary_length_before": length_before, "boundary_length_after": length_after,
+        "boundary_length_reduction": length_before - length_after,
+        "changed_faces": int(changed.sum()), "changed_surface_area": float(areas[changed].sum()),
+        "assignments": assignments,
+        "transfer_surface_area": transfer_area,
+        "transfers": [{"from_part_id": left, "to_part_id": right, **record}
+                      for (left, right), record in sorted(transfers.items())],
+        "unresolved_boundary_faces": len(unresolved), "unresolved_face_indices": unresolved,
+        "unresolved_reasons": reasons, "stop_reason": "no_admissible_moves",
+        "parts": [{"part_id": part, "boundary_faces_before": int(boundary_before[part]),
+                   "boundary_faces_after": int(boundary_after[part]),
+                   "violating_faces_before": int(violations_before[part]),
+                   "violating_faces_after": int(violations_after[part]),
+                   "face_count_before": int(counts_before[part]), "face_count_after": int(counts[part]),
+                   "components_before": int(components_before[part]), "components_after": int(components_after[part])}
+                  for part in range(num_parts)],
+        "elapsed_seconds": perf_counter() - started,
+    }
+
+
+def refine_two_edge_boundary(vertices, faces, face_part_ids, num_parts):
+    """Regularize saved face labels on CPU, preserving the source mesh arrays."""
+    import trimesh
+
+    vertices, faces, labels = np.asarray(vertices), np.asarray(faces), np.asarray(face_part_ids)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or not len(vertices) or not np.isfinite(vertices).all():
+        raise ValueError("Invalid boundary refinement vertices.")
+    if (faces.ndim != 2 or faces.shape[1] != 3 or not len(faces) or faces.dtype.kind not in "iu"
+            or faces.min() < 0 or faces.max() >= len(vertices)):
+        raise ValueError("Boundary refinement requires valid triangle faces.")
+    if (type(num_parts) is not int or num_parts < 1 or labels.shape != (len(faces),)
+            or labels.dtype.kind not in "iu" or labels.min() < 0 or labels.max() >= num_parts):
+        raise ValueError("Every boundary refinement face must have one valid part ID.")
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    points, vertex_ids = np.unique(vertices, axis=0, return_inverse=True)
+    adjacency, edges, _ = _edge_adjacency(vertex_ids[faces])
+    return _regularize_boundary_faces(labels, num_parts, adjacency, edges, mesh.area_faces, vertices=points)
 
 
 def refine_edge_connectivity(mesh, face_part_ids, num_parts: int, *,
@@ -163,7 +381,7 @@ def refine_edge_connectivity(mesh, face_part_ids, num_parts: int, *,
     unreachable = np.flatnonzero(assignments < 0)
     assignments[unreachable] = group_parts[unreachable]
     labels = assignments[groups]
-    _, _, final_parts = _groups(adjacency, labels)
+    final_count, final_groups, final_parts = _groups(adjacency, labels)
     before = np.bincount(group_parts, minlength=num_parts)
     after = np.bincount(final_parts, minlength=num_parts)
     raw_before = np.bincount(raw_group_parts, minlength=num_parts)
@@ -175,9 +393,21 @@ def refine_edge_connectivity(mesh, face_part_ids, num_parts: int, *,
     mesh_labels = np.zeros(len(faces), dtype=np.int32)
     mesh_components = _groups(adjacency, mesh_labels)[0]
     raw_mesh_components = _groups(raw_adjacency, mesh_labels)[0] if duplicate_vertices else mesh_components
+    # Report remaining disconnected components using the final face labels.
+    final_areas = np.bincount(final_groups, weights=areas, minlength=final_count)
+    final_sizes = np.bincount(final_groups, minlength=final_count)
+    unresolved = []
+    for part in np.flatnonzero(after > 1):
+        part_groups = np.flatnonzero(final_parts == part)
+        largest = max(part_groups, key=lambda group: (final_areas[group], -group))
+        for group in part_groups:
+            if group != largest:
+                unresolved.append({"part_id": int(part), "face_count": int(final_sizes[group]),
+                                   "surface_area": float(final_areas[group]),
+                                   "reason": "remaining_disconnected_component"})
     changed = labels != original
     diagnostics = {
-        "method": "shared_edge_connectivity_v2",
+        "method": "shared_edge_connectivity_v4",
         "component_definition": "shared edges with exactly coincident endpoints; no distance links; source arrays unchanged",
         "coordinate_matching": "exact; no rounding or distance tolerance",
         "source_vertex_count": len(vertices), "topology_vertex_count": len(points),
@@ -197,9 +427,7 @@ def refine_edge_connectivity(mesh, face_part_ids, num_parts: int, *,
                    "vertex_id_components_after": int(raw_after[part_id]),
                    "core_surface_area": float(group_areas[cores[part_id]]) if part_id in cores else 0.0}
                   for part_id in range(num_parts)],
-        "unresolved_components": [{"part_id": int(group_parts[group]), "face_count": int(group_sizes[group]),
-                                   "surface_area": float(group_areas[group]), "reason": "no_edge_path_to_any_retained_core"}
-                                  for group in unreachable],
+        "unresolved_components": unresolved,
         "elapsed_seconds": perf_counter() - started,
     }
     return labels.astype(np.int32, copy=False), diagnostics

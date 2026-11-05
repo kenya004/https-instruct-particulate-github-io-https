@@ -29,7 +29,8 @@ class CCSWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.original, self.original_artifacts = segmentation_fixture()
         self.refined, self.artifacts = ccs_fixture()
-        self.state = {"plan": part_plan(), "segmentation": {"result": self.original, "artifacts": self.original_artifacts}}
+        self.state = {"plan": part_plan(), "refinement_order": "ccs_then_boundary",
+                      "segmentation": {"result": self.original, "artifacts": self.original_artifacts}}
         self.client = MagicMock(base_url="http://localhost:8004")
         self.client.refine_ccs.return_value = self.refined
         self.client.download_artifact.side_effect = lambda result, filename: self.artifacts[filename]
@@ -110,6 +111,7 @@ class CCSInterfaceTests(unittest.TestCase):
             app.button[0].click().run()
         with patch.object(BackendClient, "segment", return_value=original), patch.object(BackendClient, "download_artifact", side_effect=lambda result, filename: original_artifacts[filename]):
             app.button(key="segment").click().run()
+        app.selectbox(key="refinement_order_control").set_value("ccs_then_boundary").run()
         with patch.object(BackendClient, "refine_ccs", return_value=refined) as refine, patch.object(BackendClient, "download_artifact", side_effect=lambda result, filename: artifacts[filename]):
             app.button(key="refine_ccs").click().run()
         self.assertEqual(len(app.exception), 0)
@@ -117,7 +119,7 @@ class CCSInterfaceTests(unittest.TestCase):
         self.assertEqual(app.radio[0].value, "CCS補正後")
         self.assertIn(f"分割ID: {'d' * 32}", [item.value for item in app.caption])
         self.assertEqual(app.metric[0].value, "2")
-        app.radio[0].set_value("補正前").run()
+        app.radio[0].set_value("分割直後").run()
         self.assertEqual(len(app.exception), 0)
         self.assertIn(f"分割ID: {'c' * 32}", [item.value for item in app.caption])
         self.assertEqual(app.session_state["preparation"]["segmentation"]["result"], original)

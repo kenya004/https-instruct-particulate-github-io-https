@@ -175,6 +175,8 @@ def refine_saved_segmentation(store: ModelStore, model_id: str, plan_id: str, pa
         result = export_partition(partition, plan, run_dir, segmentation_id)
         result.update(parent_segmentation_id=parent_id, method="ccs_face_centroids_v1", postprocessing=diagnostics,
                       options=parent.get("options", {}))
+        history = parent.get("processing_order", [parent["method"]] if parent.get("method") else [])
+        result["processing_order"] = [*history, "ccs_face_centroids_v1"]
         for item in diagnostics["parts"]:
             if item["components_after"] > item["components_before"]:
                 result["warnings"].append(f"{plan['parts'][item['part_id']]['name']}: 補正後に連結成分が増えています。")

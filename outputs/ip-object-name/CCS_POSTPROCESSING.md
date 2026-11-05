@@ -10,6 +10,9 @@ cd ~/git/instruct-particulate
 source .venv/bin/activate
 bundle='/mnt/c/Users/mrkab/Documents/Codex/2026-09-26/https-instruct-particulate-github-io-https/outputs/ip-object-name'
 cp "$bundle/ip_object_name/ccs_postprocessing.py" ip_object_name/
+cp "$bundle/ip_object_name/connectivity.py" ip_object_name/
+cp "$bundle/ip_object_name/segmentation.py" ip_object_name/
+cp "$bundle/ip_object_name/boundary_postprocessing.py" ip_object_name/
 cp "$bundle/ip_object_name/workflow_api.py" ip_object_name/
 
 export IP_OBJECT_NAME_MODEL=gemini-3.8-flash
@@ -24,14 +27,15 @@ Windows側のStreamlitも再起動し、ブラウザを再読み込みしてく�
 ## 操作
 
 1. 従来どおりパーツ構成を作り、「分割を実行」を押す。
-2. 「CCS補正を実行」を押す。保存済みの分割NPZからCPU処理し、GPU推論・Gemini・Blenderは呼び直しません。
-3. 「表示結果」で「補正前」「CCS補正後」を切り替える。
-4. 「表示パーツ」で個々のパーツを比較する。
-5. 「補正診断」で面数・連結成分数の前後、スキップ理由を確認する。
-6. 選択中の結果のGLB・NPZ・JSONをダウンロードする。
+2. 「補正の順序」で「2辺共有補正 → CCS補正」または「CCS補正 → 2辺共有補正」を選ぶ。
+3. 上から順に補正ボタンを押す。CCSが前段なら分割直後、後段なら2辺共有補正後のNPZからCPU処理します。「CCSの入力」で実際の入力元を確認できます。
+4. 「表示結果」で、選んだ順序の分割直後・前段後・後段後を切り替える。
+5. 「表示パーツ」で個々のパーツを比較する。
+6. 「補正診断」で面数・連結成分数の前後、スキップ理由を確認する。
+7. 選択中の結果のGLB・NPZ・JSONをダウンロードする。
 
 最大反復数は初期値5、範囲1〜30です。「CCS補正設定」で変更できます。
-繰り返し実行しても、UIは常に元の分割結果から補正します。前回のCCS結果へ累積適用しません。
+繰り返し実行しても、UIは同じ入力元（2辺共有補正後、または分割直後）から補正します。前回のCCS結果へ累積適用しません。
 結果取得に失敗した場合は「CCS結果の取得を再開」で不足ファイルだけ取得します。
 元モデル・要求文・パーツ構成の変更や、新しい分割結果の取得時には、古いCCS結果を非表示にします。
 
@@ -60,6 +64,7 @@ MCA-II全体やCCSの完全再現ではなく、`ccs_face_centroids_v1`として
 従来の`planning/<plan_id>/segmentations/<segmentation_id>/`に新しいIDで保存します。
 元の分割結果と、元結果を示す`segmentation.json`は上書きしません。
 最新のCCS結果への参照だけを`planning/<plan_id>/ccs_refinement.json`へ保存します。
+各順序の実結果は異なる分割IDのフォルダに保存し、`processing_order`で実際の補正順を記録します。UIセッション中は順序を切り替えても計算済み結果を復元します。
 
 新しい結果のJSONには以下を記録します。
 
