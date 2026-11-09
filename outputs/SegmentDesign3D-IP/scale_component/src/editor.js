@@ -40,6 +40,8 @@ let layout = { connections: [], attachments: [] };
 let layoutKey = null;
 let blending = { parts: {}, anchors: {} };
 let blendingKey = null;
+let boundaryMotion = {parts: {}, anchors: {}};
+let motionKey = null;
 let viewUpDir = null;
 let following = false;
 let showAnchors = false;
@@ -133,16 +135,19 @@ function updatePreview() {
   for (const part of partData) {
     const mesh = meshes.get(String(part.part_id));
     if (!mesh) continue;
-    const id = String(part.part_id), spec = blending.parts[id];
-    if (spec) {
+    const id = String(part.part_id), spec = blending.parts[id], motion = boundaryMotion.parts[id];
+    if (spec || motion) {
       const positions = mesh.geometry.getAttribute("position");
-      writeBlendedPositions(part, transforms, spec, positions.array);
+      writeBlendedPositions(part, transforms, spec ?? {influences: []}, positions.array, offsets[id], motion);
       positions.needsUpdate = true;
       mesh.geometry.computeVertexNormals();
       mesh.geometry.computeBoundingBox();
       mesh.geometry.computeBoundingSphere();
       mesh.scale.setScalar(1);
-      mesh.position.set(...part.center).add(new THREE.Vector3(...offsets[id])).sub(sceneCenter);
+      mesh.position.set(...part.center).sub(sceneCenter);
+      if (motion && movementAxes.has(id)) {
+        mesh.geometry.boundingBox.getCenter(movementAxes.get(id).position).add(mesh.position);
+      }
     } else {
       mesh.scale.setScalar(scales[id]);
       mesh.position.set(...part.center).add(new THREE.Vector3(...translations[id])).sub(sceneCenter);
@@ -152,9 +157,9 @@ function updatePreview() {
     const positions = anchorGeometry.getAttribute("position");
     const colors = anchorGeometry.getAttribute("color");
     for (const [index, connection] of layout.connections.entries()) {
-      const samples = blending.anchors[String(connection.connection_id)];
+      const samples = boundaryMotion.anchors[String(connection.connection_id)] ?? blending.anchors[String(connection.connection_id)];
       const ends = samples
-        ? samples.map(sample => sampledAnchor(sample, byId, transforms, blending, offsets))
+        ? samples.map(sample => sampledAnchor(sample, byId, transforms, blending, offsets, boundaryMotion))
         : [connection.part_a, connection.part_b].map(id => transformedAnchor(byId.get(id), scales[String(id)], connection.anchor, translations[String(id)]));
       const distance = new THREE.Vector3(...ends[0]).distanceTo(new THREE.Vector3(...ends[1]));
       const color = new THREE.Color(distance <= sceneExtent * 1e-7 ? 0x087863 : 0xdb6032);
@@ -282,6 +287,8 @@ function rebuild(args) {
   layoutKey = args.layout_key;
   blending = args.blending;
   blendingKey = args.blending_key;
+  boundaryMotion = args.boundary_motion;
+  motionKey = args.motion_key;
   viewUpDir = args.up_dir;
   following = args.follow;
   showAnchors = args.show_anchors;
@@ -381,6 +388,11 @@ function rebuild(args) {
       endpoints.appendChild(span);
     }
     row.appendChild(endpoints);
+    const motionLabel = document.createElement("div");
+    motionLabel.className = "empty-label";
+    motionLabel.textContent = boundaryMotion.parts[id]
+      ? `断面固定移動（遷移 ${Math.round(boundaryMotion.parts[id].ratio * 100)}%）` : "全体移動";
+    row.appendChild(motionLabel);
     const moveInputs = [], moveOutputs = [];
     for (const [axis, name] of ["X", "Y", "Z"].entries()) {
       const labelName = movementFrames[id].labels[axis];
@@ -509,7 +521,7 @@ new ResizeObserver(resize).observe(document.getElementById("workspace"));
 Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
   try {
     const args = normalizeEditorArgs(event.detail?.args);
-    if (args.source_key !== sourceKey || args.blending_key !== blendingKey || args.up_dir !== viewUpDir || args.movement_key !== movementKey) rebuild(args);
+    if (args.source_key !== sourceKey || args.blending_key !== blendingKey || args.motion_key !== motionKey || args.up_dir !== viewUpDir || args.movement_key !== movementKey) rebuild(args);
     else {
       const layoutChanged = layoutKey !== args.layout_key;
       layout = args.layout;
@@ -517,6 +529,7 @@ Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
       following = args.follow;
       showAnchors = args.show_anchors;
       blending = args.blending;
+      boundaryMotion = args.boundary_motion;
       showMovementAxes = args.show_movement_axes;
       if (!dragging && Number(args.sequence) >= sequence) {
         sequence = Number(args.sequence);

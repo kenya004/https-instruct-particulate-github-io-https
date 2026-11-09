@@ -21,7 +21,7 @@ if getattr(editing, "EDITING_PROTOCOL", 0) < 2:
     importlib.reload(editing)
 if "boundary_edges" not in connections.Connection.__dataclass_fields__:
     importlib.reload(connections)
-refresh_ui_modules(names=("connections", "workflow", "orientation", "movement_axes", "boundary_blending", "rejoining", "mesh_overlaps", "viewer", "part_editor"))
+refresh_ui_modules(names=("connections", "workflow", "orientation", "movement_axes", "boundary_blending", "boundary_motion", "rejoining", "mesh_overlaps", "viewer", "part_editor"))
 
 from backend_client import BackendClient, BackendError
 from orientation import aligned_mesh_payloads

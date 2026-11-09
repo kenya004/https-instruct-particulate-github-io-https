@@ -6,9 +6,10 @@ import streamlit as st
 import numpy as np
 from streamlit.components.v1 import declare_component
 
-from editing import editor_payload, editor_source_key, export_edited_glb, load_editable_parts, scale_parts, synchronize_editor, translate_parts, translation_controls
+from editing import editor_payload, editor_source_key, export_edited_glb, load_editable_parts, scale_parts, synchronize_editor, translation_controls
 from connections import build_connection_plan, connection_payload, connection_residuals, detect_connections, follow_connections
 from boundary_blending import apply_boundary_blend, blend_metadata, blended_anchor_residuals, build_boundary_blend
+from boundary_motion import apply_boundary_motion, build_motion_distances, motion_metadata, motion_weights
 from movement_axes import build_movement_frames
 from mesh_overlaps import METHOD as OVERLAP_METHOD, assemble_parts, find_face_overlaps, only_new_overlaps, overlap_frame, part_face_ids
 from rejoining import export_rejoined_glb, export_rejoined_npz, has_rejoin_data, rejoin_input_key, rejoin_parts, rejoined_payload
@@ -38,6 +39,18 @@ def _load_blending(content, manifest, selected_ids, ratio, root_id):
 def _load_frames(content, manifest, up_dir, selected, enabled):
     parts, connections, _, _ = _load(content, manifest, 2)
     return build_movement_frames(content, parts, connections, up_dir, dict(selected), enabled=enabled)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _load_motion_distances(content, manifest):
+    parts, connections, _, _ = _load(content, manifest, 2)
+    return build_motion_distances(content, manifest, parts, connections)
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def _load_motion(content, manifest, ratios):
+    distances = _load_motion_distances(content, manifest) if ratios else {"parts": {}, "anchors": {}}
+    return motion_weights(distances, dict(ratios))
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -87,7 +100,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         st.warning(warning)
     if connections:
         st.caption(f"接続領域：{len(connections)} / 追従に使用：{len(plan.attachments) if follow else 0}。緑の点は位置の一致、橙の点と線はずれを表します。")
-        st.caption("拡大縮小に伴う接続位置へ追従します。手動移動では接続点を維持しません。")
+        st.caption("拡大縮小に伴う接続位置へ追従します。移動操作で境界を残す場合は、下の移動方法から断面固定移動を選んでください。")
         if plan.unused_ids:
             st.warning("輪状の接続または同じパーツ間の複数接続があります。境界の長い接続を優先して追従し、使わない接続のずれも表示します。")
         if len(plan.roots) > 1:
@@ -102,6 +115,22 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
     with st.spinner("境界からの距離を計算しています"):
         blending = _load_blending(content, result, tuple(sorted(selected)), percent / 100, root_id)
     for warning in blending["warnings"]:
+        st.warning(warning)
+    motion_ratios = {}
+    with st.expander("パーツごとの移動方法"):
+        for part in parts:
+            enabled = can_rejoin and part.part_id in connected_ids and bool(len(part.faces))
+            mode = st.selectbox(f"{part.name} の移動方法", ["全体移動", "断面固定移動"], disabled=not enabled,
+                                key=f"boundary_motion_mode_{source_key}_{part.part_id}")
+            fixed = enabled and mode == "断面固定移動"
+            band = st.slider(f"{part.name} の遷移範囲（%）", 1, 100, 20, disabled=not fixed,
+                             key=f"boundary_motion_range_{source_key}_{part.part_id}")
+            if fixed:
+                motion_ratios[part.part_id] = band / 100
+        st.caption("断面固定移動は、移動前のすべての共有境界を固定し、メッシュに沿った距離に応じて指定移動量へ滑らかに近づけます。範囲は境界から最奥までの距離に対する割合です。")
+    with st.spinner("断面固定移動の重みを準備しています"):
+        motion = _load_motion(content, result, tuple(sorted(motion_ratios.items())))
+    for warning in motion["warnings"]:
         st.warning(warning)
     frame_mode = st.selectbox("移動方向の基準", ["断面の近似平面", "入力XYZ"], key=f"movement_mode_{source_key}")
     choices = {}
@@ -122,7 +151,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
     show_overlaps = st.checkbox("Faceの重なりを表示", value=True, key=f"show_overlaps_{source_key}")
     st.caption("未編集時にはない新しい交差ペアのFaceだけを赤く表示します。判定はスライダーを離した後に更新します。編集は制限せず、保存するモデルは元のパーツ色を保持します。")
     movement = translation_controls(parts)
-    st.caption(f"移動は接触を維持しません。軸の矢印は赤＝U、緑＝V、青＝N。断面がないパーツは入力XYZです。入力座標の単位で各軸 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
+    st.caption(f"全体移動は接触を維持しません。断面固定移動は操作前の境界を固定します。軸の矢印は赤＝U、緑＝V、青＝N。断面がないパーツは入力XYZです。入力座標の単位で各軸 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
     if follow and connections:
         edited, automatic = follow_connections(parts, state["scales"], plan)
     else:
@@ -130,15 +159,16 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         automatic = {part.part_id: np.zeros(3) for part in parts}
     uniform_parts = edited
     edited = apply_boundary_blend(parts, edited, state["scales"], automatic, blending)
-    # Exclude internal pairs only when local blending actually left the part
-    # identical to its uniformly scaled/translated geometry.
-    uniform_ids = {part.part_id for part, uniform in zip(edited, uniform_parts)
-                   if np.array_equal(part.vertices, uniform.vertices)}
     # Manual offsets are applied after the whole attachment tree is solved; they never propagate.
-    edited = translate_parts(edited, state["offsets"])
+    edited = apply_boundary_motion(edited, state["offsets"], motion)
+    # Both boundary blending and boundary-fixed movement can create local
+    # deformation. Only exact uniform poses may skip internal overlap checks.
+    uniform_ids = {part.part_id for part, uniform in zip(edited, uniform_parts)
+                   if np.array_equal(part.vertices, uniform.vertices + state["offsets"][str(part.part_id)])}
     translations = {part.part_id: automatic[part.part_id] + state["offsets"][str(part.part_id)] for part in parts}
     residuals = connection_residuals(parts, state["scales"], connections, translations)
-    residuals = blended_anchor_residuals(edited, connections, blending, residuals)
+    samples = {**blending["anchors"], **motion["anchors"]}
+    residuals = blended_anchor_residuals(edited, connections, {"anchors": samples}, residuals)
     blend_info = blend_metadata(blending, parts, state["scales"], automatic)
     if blend_info["conflicting_fixed_vertices"]:
         st.warning("同じ境界頂点に接する複数の未選択パーツの位置が一致していません。基準パーツ、次にID順で接続先を選びます。")
@@ -147,7 +177,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
                 "manual_translations": state["offsets"],
                 "translations": {str(index): value.tolist() for index, value in translations.items()},
                 "anchor_residuals": {str(index): value for index, value in residuals.items()},
-                "boundary_blending": blend_info, "movement_frames": frames}
+                "boundary_blending": blend_info, "movement_frames": frames, "boundary_motion": motion_metadata(motion)}
     overlap_report, overlap_faces = None, {}
     reference_report, reference_face_ids = None, None
     if show_overlaps:
@@ -165,7 +195,8 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
     sequence_before = state["sequence"]
     event = _component(
         source_key=source_key, parts=editor_payload(parts), scales=state["scales"],
-        editor_protocol=5, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
+        editor_protocol=6, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
+        boundary_motion=motion, motion_key=repr(sorted(motion_ratios.items())),
         movement_key=f"{frame_mode}:{sorted(choices.items())}",
         blending_key=f"{root_id}:{sorted(selected)}:{percent}",
         offsets=state["offsets"], movement=movement, show_overlaps=show_overlaps, overlap_faces=overlap_faces,

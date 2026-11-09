@@ -29,21 +29,9 @@ def _distances(graph, seeds, limit=float("inf")):
     return distances
 
 
-def build_boundary_blend(content, manifest, parts, connections, selected_ids, ratio=0.2, root_id=None):
-    """Use exact seam correspondence and edge-path distances on the rest mesh.
-
-    Unselected incident parts supply boundary targets first; ties prefer the
-    existing root, then part ID. Every copy at a contact uses the same target.
-    """
-    selected = set(selected_ids)
+def boundary_geometry(content, manifest, parts):
+    """Validate rest-mesh correspondence and merge exact coordinate seams."""
     by_id = {part.part_id: part for part in parts}
-    if (any(type(part) is not int or part not in by_id or not len(by_id[part].faces) for part in selected)
-            or type(ratio) not in (int, float) or not np.isfinite(ratio) or not 0 < ratio <= 1):
-        raise ValueError("境界なじませの対象パーツまたは範囲が不正です。")
-    payload = {"method": "boundary_blend_v1", "selected_ids": sorted(selected), "ratio": float(ratio),
-               "parts": {}, "anchors": {}, "reference_checks": [], "warnings": []}
-    if not selected:
-        return payload
     with np.load(io.BytesIO(content), allow_pickle=False) as data:
         if not {"vertices", "faces", "face_part_ids"}.issubset(data.files):
             raise ValueError("境界なじませには元メッシュの頂点・面・所属情報が必要です。")
@@ -69,6 +57,58 @@ def build_boundary_blend(content, manifest, parts, connections, selected_ids, ra
                     or not np.all(labels[source_faces] == part.part_id)):
                 raise ValueError("元メッシュと編集パーツの頂点・面の対応が不正です。")
             local_ids[part.part_id] = canonical[source]
+    return points, local_ids
+
+
+def part_edge_graph(points, source_ids, part):
+    nodes, node_for_local = np.unique(source_ids, return_inverse=True)
+    node_index = {int(source): index for index, source in enumerate(nodes)}
+    graph = [[] for _ in nodes]
+    triangles = node_for_local[part.faces]
+    edges = np.unique(np.sort(np.concatenate([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]]), axis=1), axis=0)
+    for a, b in edges:
+        if a == b:
+            continue
+        length = float(np.linalg.norm(points[nodes[a]] - points[nodes[b]]))
+        graph[a].append((int(b), length))
+        graph[b].append((int(a), length))
+    return node_for_local, node_index, graph
+
+
+def boundary_anchor_samples(points, local_ids, connections):
+    maps = {part: {int(source): int(index) for index, source in reversed(list(enumerate(ids)))} for part, ids in local_ids.items()}
+    anchors = {}
+    for connection in connections:
+        samples = []
+        for part_id in (connection.part_a, connection.part_b):
+            weights = defaultdict(float)
+            for a, b in connection.boundary_edges:
+                length = float(np.linalg.norm(points[a] - points[b]))
+                for source in (a, b):
+                    weights[maps[part_id][source]] += length / (2 * connection.boundary_length)
+            indices = sorted(weights)
+            samples.append({"part_id": part_id, "indices": indices, "weights": [weights[index] for index in indices]})
+        if all(sample["indices"] for sample in samples):
+            anchors[str(connection.connection_id)] = samples
+    return anchors
+
+
+def build_boundary_blend(content, manifest, parts, connections, selected_ids, ratio=0.2, root_id=None):
+    """Use exact seam correspondence and edge-path distances on the rest mesh.
+
+    Unselected incident parts supply boundary targets first; ties prefer the
+    existing root, then part ID. Every copy at a contact uses the same target.
+    """
+    selected = set(selected_ids)
+    by_id = {part.part_id: part for part in parts}
+    if (any(type(part) is not int or part not in by_id or not len(by_id[part].faces) for part in selected)
+            or type(ratio) not in (int, float) or not np.isfinite(ratio) or not 0 < ratio <= 1):
+        raise ValueError("境界なじませの対象パーツまたは範囲が不正です。")
+    payload = {"method": "boundary_blend_v1", "selected_ids": sorted(selected), "ratio": float(ratio),
+               "parts": {}, "anchors": {}, "reference_checks": [], "warnings": []}
+    if not selected:
+        return payload
+    points, local_ids = boundary_geometry(content, manifest, parts)
 
     # Part-contact components at a source vertex avoid linking unrelated point
     # contacts. Only actual shared boundary edges create contact relationships.
@@ -99,17 +139,7 @@ def build_boundary_blend(content, manifest, parts, connections, selected_ids, ra
 
     for part_id in sorted(selected):
         part = by_id[part_id]
-        nodes, node_for_local = np.unique(local_ids[part_id], return_inverse=True)
-        node_index = {int(source): index for index, source in enumerate(nodes)}
-        graph = [[] for _ in nodes]
-        triangles = node_for_local[part.faces]
-        edges = np.unique(np.sort(np.concatenate([triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]]), axis=1), axis=0)
-        for a, b in edges:
-            if a == b:
-                continue
-            length = float(np.linalg.norm(points[nodes[a]] - points[nodes[b]]))
-            graph[a].append((int(b), length))
-            graph[b].append((int(a), length))
+        node_for_local, node_index, graph = part_edge_graph(points, local_ids[part_id], part)
         boundary = {node_index[source]: reference for source, reference in seeds[part_id].items() if source in node_index}
         if not boundary:
             payload["warnings"].append(f"{part.name}: 対応する共有境界がないため、従来の変形を使います。")
@@ -118,14 +148,14 @@ def build_boundary_blend(content, manifest, parts, connections, selected_ids, ra
         finite = np.isfinite(nearest)
         depth = float(nearest[finite].max())
         radius = float(ratio * depth)
-        strength = np.zeros(len(nodes))
+        strength = np.zeros(len(graph))
         if radius > 0:
             t = np.minimum(nearest[finite] / radius, 1)
             strength[finite] = 1 - t * t * (3 - 2 * t)
         else:
             strength[nearest == 0] = 1
         references = sorted(set(boundary.values()))
-        kernels = np.zeros((len(references), len(nodes)))
+        kernels = np.zeros((len(references), len(graph)))
         for row, reference in enumerate(references):
             source_nodes = [node for node, owner in boundary.items() if owner == reference]
             if len(references) == 1:
@@ -156,19 +186,7 @@ def build_boundary_blend(content, manifest, parts, connections, selected_ids, ra
 
     # Weighted boundary-vertex samples make anchor diagnostics reflect the
     # deformed geometry, rather than the old uniform-scale approximation.
-    maps = {part: {int(source): int(index) for index, source in reversed(list(enumerate(ids)))} for part, ids in local_ids.items()}
-    for connection in connections:
-        samples = []
-        for part_id in (connection.part_a, connection.part_b):
-            weights = defaultdict(float)
-            for a, b in connection.boundary_edges:
-                length = float(np.linalg.norm(points[a] - points[b]))
-                for source in (a, b):
-                    weights[maps[part_id][source]] += length / (2 * connection.boundary_length)
-            indices = sorted(weights)
-            samples.append({"part_id": part_id, "indices": indices, "weights": [weights[index] for index in indices]})
-        if all(sample["indices"] for sample in samples):
-            payload["anchors"][str(connection.connection_id)] = samples
+    payload["anchors"] = boundary_anchor_samples(points, local_ids, connections)
     return payload
 
 

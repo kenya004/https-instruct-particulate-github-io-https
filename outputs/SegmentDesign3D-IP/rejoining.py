@@ -35,7 +35,7 @@ def has_rejoin_data(content: bytes, manifest: dict) -> bool:
 def rejoin_input_key(source_key: str, scales: dict, connections: dict) -> str:
     settings = {"source": source_key, "scales": scales, "root": connections["root_id"],
                 "follow": connections["enabled"], "translations": connections["translations"],
-                "boundary_blending": connections.get("boundary_blending")}
+                "boundary_blending": connections.get("boundary_blending"), "boundary_motion": connections.get("boundary_motion")}
     return hashlib.sha256(json.dumps(settings, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
