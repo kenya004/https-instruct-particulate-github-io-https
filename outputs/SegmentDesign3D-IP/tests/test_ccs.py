@@ -115,7 +115,7 @@ class CCSInterfaceTests(unittest.TestCase):
         with patch.object(BackendClient, "refine_ccs", return_value=refined) as refine, patch.object(BackendClient, "download_artifact", side_effect=lambda result, filename: artifacts[filename]):
             app.button(key="refine_ccs").click().run()
         self.assertEqual(len(app.exception), 0)
-        refine.assert_called_once_with(original, {"max_iterations": 5})
+        refine.assert_called_once_with(original, {"max_iterations": 1})
         self.assertEqual(app.radio[0].value, "CCS補正後")
         self.assertIn(f"分割ID: {'d' * 32}", [item.value for item in app.caption])
         self.assertEqual(app.metric[0].value, "2")

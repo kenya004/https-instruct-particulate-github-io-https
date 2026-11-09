@@ -6,6 +6,8 @@ import { solveTranslations, transformedAnchor } from "./connection_solver.js";
 import { normalizeEditorArgs } from "./editor_args.js";
 import { affineTransforms, sampledAnchor, writeBlendedPositions } from "./boundary_blending.js";
 import { applyDisplayOrientation, CAMERA_EYE, DISPLAY_UP, sourceToDisplay } from "./orientation.js";
+import { localOffset, setLocalOffset } from "./translation_frames.js";
+import { highlightPositions } from "./overlap_highlights.js";
 
 const viewport = document.getElementById("viewport");
 const sliderList = document.getElementById("sliders");
@@ -17,6 +19,15 @@ let sequence = 0;
 let scales = {};
 let offsets = {};
 let movement = { limit: 1, step: 0.001 };
+let movementFrames = {};
+let movementKey = null;
+let movementAxes = new Map();
+let showMovementAxes = false;
+let overlapFaces = {};
+let overlapMeshes = new Map();
+let showOverlaps = false;
+let overlapStatus = "";
+let pendingOverlaps = false;
 let dragging = false;
 let dirty = true;
 let cameraRadius = 0;
@@ -114,6 +125,12 @@ function updatePreview() {
   const transforms = affineTransforms(partData, scales, automatic);
   const byId = new Map(partData.map(part => [part.part_id, part]));
   for (const part of partData) {
+    const arrows = movementAxes.get(String(part.part_id));
+    if (!arrows) continue;
+    arrows.position.set(...part.center).add(new THREE.Vector3(...translations[String(part.part_id)])).sub(sceneCenter);
+    arrows.visible = showMovementAxes;
+  }
+  for (const part of partData) {
     const mesh = meshes.get(String(part.part_id));
     if (!mesh) continue;
     const id = String(part.part_id), spec = blending.parts[id];
@@ -153,8 +170,47 @@ function updatePreview() {
     anchorPoints.visible = showAnchors;
     anchorLines.visible = showAnchors;
   }
+  updateOverlapHighlights();
   dirty = true;
   keepInFrame();
+}
+
+function updateOverlapHighlights() {
+  for (const part of partData) {
+    const id = String(part.part_id), mesh = meshes.get(id), ids = overlapFaces[id] ?? [];
+    if (!mesh) continue;
+    let overlay = overlapMeshes.get(id);
+    if (!ids.length) {
+      if (overlay) {
+        overlay.removeFromParent();
+        overlay.geometry.dispose();
+        overlay.material.dispose();
+        overlapMeshes.delete(id);
+      }
+      continue;
+    }
+    if (!overlay) {
+      overlay = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({
+        color: 0xe12b35, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+      }));
+      overlay.renderOrder = 10;
+      mesh.add(overlay);
+      overlapMeshes.set(id, overlay);
+    }
+    if (overlay.geometry.getAttribute("position")?.count !== ids.length * 3) {
+      overlay.geometry.dispose();
+      overlay.geometry = new THREE.BufferGeometry();
+      overlay.geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(ids.length * 9), 3));
+    }
+    const position = overlay.geometry.getAttribute("position");
+    highlightPositions(mesh.geometry.getAttribute("position").array, part.faces, ids, position.array);
+    position.needsUpdate = true;
+    overlay.geometry.computeBoundingBox();
+    overlay.geometry.computeBoundingSphere();
+    overlay.visible = showOverlaps && !pendingOverlaps;
+  }
+  const status = document.getElementById("overlap-status");
+  status.textContent = showOverlaps && pendingOverlaps ? "操作終了後に重なり表示を更新します" : overlapStatus;
 }
 
 function updateScale(partId, value, redraw = true) {
@@ -165,7 +221,10 @@ function updateScale(partId, value, redraw = true) {
     widget.input.value = String(value);
     widget.output.value = `${value.toFixed(2)}×`;
   }
-  if (redraw) updatePreview();
+  if (redraw) {
+    pendingOverlaps = true;
+    updatePreview();
+  }
 }
 
 function formatOffset(value) {
@@ -174,13 +233,27 @@ function formatOffset(value) {
 
 function updateOffset(partId, axis, value, redraw = true) {
   const id = String(partId);
-  offsets[id][axis] = value;
+  offsets[id] = setLocalOffset(offsets[id], axis, value, movementFrames[id]);
+  refreshOffsetControls(id);
+  if (redraw) {
+    pendingOverlaps = true;
+    updatePreview();
+  }
+}
+
+function refreshOffsetControls(id) {
   const widget = widgets.get(id);
   if (widget) {
-    widget.moveInputs[axis].value = String(value);
-    widget.moveOutputs[axis].value = formatOffset(value);
+    const coordinates = localOffset(offsets[id], movementFrames[id]);
+    for (let axis = 0; axis < 3; axis += 1) {
+      const value = coordinates[axis];
+      const limit = Math.max(movement.limit, Math.ceil(Math.abs(value) / movement.step) * movement.step);
+      widget.moveInputs[axis].min = String(-limit);
+      widget.moveInputs[axis].max = String(limit);
+      widget.moveInputs[axis].value = String(value);
+      widget.moveOutputs[axis].value = formatOffset(value);
+    }
   }
-  if (redraw) updatePreview();
 }
 
 function commit() {
@@ -197,6 +270,13 @@ function rebuild(args) {
   scales = { ...args.scales };
   offsets = Object.fromEntries(args.parts.map(part => [String(part.part_id), [...(args.offsets?.[String(part.part_id)] ?? [0, 0, 0])]]));
   movement = args.movement;
+  movementFrames = args.movement_frames;
+  movementKey = args.movement_key;
+  showMovementAxes = args.show_movement_axes;
+  overlapFaces = args.overlap_faces;
+  showOverlaps = args.show_overlaps;
+  overlapStatus = args.overlap_status;
+  pendingOverlaps = false;
   partData = args.parts;
   layout = args.layout;
   layoutKey = args.layout_key;
@@ -207,12 +287,26 @@ function rebuild(args) {
   showAnchors = args.show_anchors;
   widgets.clear();
   sliderList.replaceChildren();
+  for (const overlay of overlapMeshes.values()) {
+    overlay.removeFromParent();
+    overlay.geometry.dispose();
+    overlay.material.dispose();
+  }
+  overlapMeshes.clear();
   for (const mesh of meshes.values()) {
     group?.remove(mesh);
     mesh.geometry.dispose();
     mesh.material.dispose();
   }
   meshes.clear();
+  for (const arrows of movementAxes.values()) {
+    displayRoot.remove(arrows);
+    for (const arrow of arrows.children) {
+      arrow.line.material.dispose();
+      arrow.cone.material.dispose();
+    }
+  }
+  movementAxes.clear();
   if (anchorGeometry) {
     displayRoot.remove(anchorPoints, anchorLines);
     anchorGeometry.dispose();
@@ -289,13 +383,14 @@ function rebuild(args) {
     row.appendChild(endpoints);
     const moveInputs = [], moveOutputs = [];
     for (const [axis, name] of ["X", "Y", "Z"].entries()) {
+      const labelName = movementFrames[id].labels[axis];
       const control = document.createElement("div");
       control.className = "translation";
       control.dataset.axis = name;
       const moveHeading = document.createElement("div");
       moveHeading.className = "translation-heading";
       const moveLabel = document.createElement("label");
-      moveLabel.textContent = `${name} 移動`;
+      moveLabel.textContent = `${labelName} 移動`;
       moveLabel.htmlFor = `move-${id}-${name}`;
       const moveOutput = document.createElement("output");
       moveOutput.htmlFor = moveLabel.htmlFor;
@@ -306,7 +401,7 @@ function rebuild(args) {
       moveInput.max = String(movement.limit);
       moveInput.step = String(movement.step);
       moveInput.disabled = empty;
-      moveInput.setAttribute("aria-label", `${part.name} ${name}移動`);
+      moveInput.setAttribute("aria-label", `${part.name} ${labelName}移動`);
       moveInput.addEventListener("pointerdown", () => { dragging = true; });
       moveInput.addEventListener("input", () => updateOffset(id, axis, Number(moveInput.value)));
       moveInput.addEventListener("change", commit);
@@ -337,9 +432,23 @@ function rebuild(args) {
       mesh.userData.partId = part.part_id;
       group.add(mesh);
       meshes.set(id, mesh);
+      const arrows = new THREE.Group();
+      const partBounds = new THREE.Box3().setFromPoints(part.vertices.map(point => new THREE.Vector3(...point)));
+      const arrowLength = Math.max(partBounds.getSize(new THREE.Vector3()).length() * .25, movement.limit * .02);
+      movementFrames[id].basis.forEach((axis, index) => {
+        const arrow = new THREE.ArrowHelper(new THREE.Vector3(...axis), new THREE.Vector3(), arrowLength, [0xb34848, 0x287b52, 0x356db0][index]);
+        for (const item of [arrow.line, arrow.cone]) {
+          item.material.depthTest = false;
+          item.material.depthWrite = false;
+          item.renderOrder = 30;
+        }
+        arrows.add(arrow);
+      });
+      displayRoot.add(arrows);
+      movementAxes.set(id, arrows);
     }
     updateScale(id, Number(scales[id] ?? 1), false);
-    for (let axis = 0; axis < 3; axis += 1) updateOffset(id, axis, Number(offsets[id][axis]), false);
+    refreshOffsetControls(id);
   }
   if (renderer) {
     const extent = Math.max(bounds.getSize(new THREE.Vector3()).length(), 1e-8);
@@ -385,8 +494,10 @@ function resize() {
 document.getElementById("reset").addEventListener("click", () => {
   for (const id of widgets.keys()) {
     updateScale(id, 1, false);
-    for (let axis = 0; axis < 3; axis += 1) updateOffset(id, axis, 0, false);
+    offsets[id] = [0, 0, 0];
+    refreshOffsetControls(id);
   }
+  pendingOverlaps = true;
   updatePreview();
   commit();
 });
@@ -398,7 +509,7 @@ new ResizeObserver(resize).observe(document.getElementById("workspace"));
 Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
   try {
     const args = normalizeEditorArgs(event.detail?.args);
-    if (args.source_key !== sourceKey || args.blending_key !== blendingKey || args.up_dir !== viewUpDir) rebuild(args);
+    if (args.source_key !== sourceKey || args.blending_key !== blendingKey || args.up_dir !== viewUpDir || args.movement_key !== movementKey) rebuild(args);
     else {
       const layoutChanged = layoutKey !== args.layout_key;
       layout = args.layout;
@@ -406,12 +517,18 @@ Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
       following = args.follow;
       showAnchors = args.show_anchors;
       blending = args.blending;
+      showMovementAxes = args.show_movement_axes;
       if (!dragging && Number(args.sequence) >= sequence) {
         sequence = Number(args.sequence);
         for (const [id, value] of Object.entries(args.scales)) updateScale(id, Number(value), false);
         for (const [id, value] of Object.entries(args.offsets)) {
-          for (let axis = 0; axis < 3; axis += 1) updateOffset(id, axis, Number(value[axis]), false);
+          offsets[id] = [...value];
+          refreshOffsetControls(id);
         }
+        overlapFaces = args.overlap_faces;
+        showOverlaps = args.show_overlaps;
+        overlapStatus = args.overlap_status;
+        pendingOverlaps = false;
       }
       updatePreview();
       if (layoutChanged) fitView();

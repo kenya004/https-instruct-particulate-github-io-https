@@ -8,6 +8,8 @@ from streamlit.components.v1 import declare_component
 from editing import editor_payload, editor_source_key, export_edited_glb, load_editable_parts, scale_parts, synchronize_editor, translate_parts, translation_controls
 from connections import build_connection_plan, connection_payload, connection_residuals, detect_connections, follow_connections
 from boundary_blending import apply_boundary_blend, blend_metadata, blended_anchor_residuals, build_boundary_blend
+from movement_axes import build_movement_frames
+from mesh_overlaps import METHOD as OVERLAP_METHOD, assemble_parts, find_face_overlaps, part_face_ids
 from rejoining import export_rejoined_glb, export_rejoined_npz, has_rejoin_data, rejoin_input_key, rejoin_parts, rejoined_payload
 from viewer import mesh_figure, mesh_viewer_config
 
@@ -31,6 +33,24 @@ def _load_blending(content, manifest, selected_ids, ratio, root_id):
     return build_boundary_blend(content, manifest, parts, connections, selected_ids, ratio, root_id)
 
 
+@st.cache_data(show_spinner=False, max_entries=12)
+def _load_frames(content, manifest, up_dir, selected, enabled):
+    parts, connections, _, _ = _load(content, manifest, 2)
+    return build_movement_frames(content, parts, connections, up_dir, dict(selected), enabled=enabled)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _check_overlaps(signature, _vertices, _faces):
+    return find_face_overlaps(_vertices, _faces)
+
+
+def _overlaps(vertices, faces):
+    # Hash every coordinate: sampled hashes could miss small local edits.
+    schema = repr((vertices.shape, vertices.dtype.str, faces.shape, faces.dtype.str)).encode()
+    signature = hashlib.sha256(OVERLAP_METHOD.encode() + schema + vertices.tobytes() + faces.tobytes()).hexdigest()
+    return _check_overlaps(signature, vertices, faces)
+
+
 def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
     parts, connections, warnings, can_rejoin = _load(content, result, 2)
     source_key = editor_source_key(result, content)
@@ -48,7 +68,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         st.warning(warning)
     if connections:
         st.caption(f"接続領域：{len(connections)} / 追従に使用：{len(plan.attachments) if follow else 0}。緑の点は位置の一致、橙の点と線はずれを表します。")
-        st.caption("拡大縮小に伴う接続位置へ追従します。X/Y/Zの手動移動では接続点を維持しません。")
+        st.caption("拡大縮小に伴う接続位置へ追従します。手動移動では接続点を維持しません。")
         if plan.unused_ids:
             st.warning("輪状の接続または同じパーツ間の複数接続があります。境界の長い接続を優先して追従し、使わない接続のずれも表示します。")
         if len(plan.roots) > 1:
@@ -64,18 +84,26 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         blending = _load_blending(content, result, tuple(sorted(selected)), percent / 100, root_id)
     for warning in blending["warnings"]:
         st.warning(warning)
+    frame_mode = st.selectbox("移動方向の基準", ["断面の近似平面", "入力XYZ"], key=f"movement_mode_{source_key}")
+    choices = {}
+    with st.expander("移動軸の基準接続"):
+        for part_id in available:
+            candidates = sorted((item for item in connections if part_id in (item.part_a, item.part_b)),
+                                key=lambda item: (-item.boundary_length, item.connection_id))
+            if len(candidates) > 1:
+                labels = {item.connection_id: f"{names[item.part_b if item.part_a == part_id else item.part_a]} / 接続 {item.connection_id}" for item in candidates}
+                choices[part_id] = st.selectbox(names[part_id], list(labels), format_func=lambda index, labels=labels: labels[index],
+                                               disabled=frame_mode == "入力XYZ", key=f"movement_connection_{source_key}_{part_id}")
+        st.caption("複数の接続がある場合、初期値は境界が最も長い接続です。移動軸は元の境界から計算し、倍率や移動によって回転しません。")
+    frames = _load_frames(content, result, up_dir, tuple(sorted(choices.items())), frame_mode != "入力XYZ")
+    for frame in frames.values():
+        if frame["warning"]:
+            st.warning(frame["warning"])
+    show_axes = st.checkbox("移動軸を表示", value=True, key=f"movement_axes_show_{source_key}")
+    show_overlaps = st.checkbox("Faceの重なりを表示", value=True, key=f"show_overlaps_{source_key}")
+    st.caption("重なるFaceを赤く表示します。判定はスライダーを離した後に更新します。編集は制限せず、保存するモデルは元のパーツ色を保持します。")
     movement = translation_controls(parts)
-    st.caption(f"X/Y/Z移動：入力モデルの座標軸・座標単位。表示の上方向は入力の{up_dir}です。各軸の範囲 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
-    event = _component(
-        source_key=source_key, parts=editor_payload(parts), scales=state["scales"],
-        editor_protocol=3, blending=blending,
-        blending_key=f"{root_id}:{sorted(selected)}:{percent}",
-        offsets=state["offsets"], movement=movement,
-        layout=layout, follow=bool(follow and connections), show_anchors=bool(show_anchors and connections),
-        layout_key=f"{root_id}:{bool(follow)}:{bool(show_anchors)}",
-        sequence=state["sequence"], up_dir=up_dir, default=None, key=f"part_scale_move_{source_key}",
-    )
-    synchronize_editor(state, source_key, parts, event)
+    st.caption(f"移動は接触を維持しません。軸の矢印は赤＝U、緑＝V、青＝N。断面がないパーツは入力XYZです。入力座標の単位で各軸 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
     if follow and connections:
         edited, automatic = follow_connections(parts, state["scales"], plan)
     else:
@@ -95,8 +123,32 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
                 "manual_translations": state["offsets"],
                 "translations": {str(index): value.tolist() for index, value in translations.items()},
                 "anchor_residuals": {str(index): value for index, value in residuals.items()},
-                "boundary_blending": blend_info}
-    state.update(edited_parts=edited, connections=metadata)
+                "boundary_blending": blend_info, "movement_frames": frames}
+    overlap_report, overlap_faces = None, {}
+    if show_overlaps:
+        vertices, faces, slices = assemble_parts(edited)
+        with st.spinner("Faceの重なりを検査しています"):
+            overlap_report = _overlaps(vertices, faces)
+        overlap_faces = part_face_ids(overlap_report, slices)
+        count = len(overlap_report["face_ids"])
+        st.caption(f"重なるFace：{count}面 / {overlap_report['pair_count']}組。赤いFaceを確認し、必要に応じて移動や倍率を調整してください。")
+    state.update(edited_parts=edited, connections=metadata, overlap_report=overlap_report)
+    sequence_before = state["sequence"]
+    event = _component(
+        source_key=source_key, parts=editor_payload(parts), scales=state["scales"],
+        editor_protocol=5, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
+        movement_key=f"{frame_mode}:{sorted(choices.items())}",
+        blending_key=f"{root_id}:{sorted(selected)}:{percent}",
+        offsets=state["offsets"], movement=movement, show_overlaps=show_overlaps, overlap_faces=overlap_faces,
+        overlap_status=(f"重なるFace：{len(overlap_report['face_ids'])}面 / {overlap_report['pair_count']}組" if overlap_report else "重なり表示はオフです"),
+        layout=layout, follow=bool(follow and connections), show_anchors=bool(show_anchors and connections),
+        layout_key=f"{root_id}:{bool(follow)}:{bool(show_anchors)}",
+        sequence=state["sequence"], up_dir=up_dir, default=None, key=f"part_scale_move_{source_key}",
+    )
+    synchronize_editor(state, source_key, parts, event, movement_frames=frames)
+    if state["sequence"] != sequence_before:
+        # Return the diagnostics for the newly committed pose to the same iframe.
+        st.rerun()
     if connections:
         with st.expander("検出した接続関係"):
             used = {item.connection_id for item in plan.attachments}
@@ -127,7 +179,16 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         st.caption(f"Mesh数：1 / 連結成分：{statistics['connected_components']} / 元の面：{statistics['original_faces']} / 追加した接続面：{statistics['bridge_faces']} / 統合した頂点：{statistics['welded_vertices']}")
         if statistics["ambiguous_edges"]:
             st.caption(f"3面以上が共有する境界エッジ{statistics['ambiguous_edges']}本は、橋渡し面の自動生成から除外しました。")
-        st.plotly_chart(mesh_figure([rejoined_payload(joined)], up_dir=up_dir), width="stretch", key=f"rejoined_view_{revision}_{up_dir}", config=mesh_viewer_config())
+        payload = rejoined_payload(joined)
+        if show_overlaps:
+            with st.spinner("結合後のFaceの重なりを検査しています"):
+                report = _overlaps(np.asarray(joined.mesh.vertices), np.asarray(joined.mesh.faces))
+            saved["overlap_report"] = report
+            marked = set(report["face_ids"])
+            payload["face_colors"] = ["#e12b35" if index in marked else color for index, color in enumerate(payload["face_colors"])]
+            bridges = sum(bool(joined.is_bridge[index]) for index in marked)
+            st.caption(f"結合後の重なるFace：{len(marked)}面（うち追加面：{bridges}面）/ {report['pair_count']}組。表示の赤色は検査用で、出力ファイルの色は保持します。")
+        st.plotly_chart(mesh_figure([payload], up_dir=up_dir), width="stretch", key=f"rejoined_view_{revision}_{up_dir}", config=mesh_viewer_config())
         st.download_button("結合後 GLB", saved["glb"], file_name=f"{result['segmentation_id']}_rejoined.glb",
                            mime="model/gltf-binary", key="download_rejoined_glb", icon=":material/download:")
         st.download_button("結合後 NPZ", saved["npz"], file_name=f"{result['segmentation_id']}_rejoined.npz",

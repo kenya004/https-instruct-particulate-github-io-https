@@ -17,11 +17,11 @@ import connections
 # Upgrade the older client once without reloading its class on every rerun.
 if not hasattr(backend_client.BackendClient, "refine_boundary"):
     importlib.reload(backend_client)
-if not all(hasattr(editing, name) for name in ("translate_parts", "translation_controls")):
+if getattr(editing, "EDITING_PROTOCOL", 0) < 2:
     importlib.reload(editing)
 if "boundary_edges" not in connections.Connection.__dataclass_fields__:
     importlib.reload(connections)
-refresh_ui_modules(names=("workflow", "orientation", "boundary_blending", "rejoining", "viewer", "part_editor"))
+refresh_ui_modules(names=("workflow", "orientation", "movement_axes", "boundary_blending", "rejoining", "mesh_overlaps", "viewer", "part_editor"))
 
 from backend_client import BackendClient, BackendError
 from part_editor import render_part_editor
@@ -173,7 +173,7 @@ if plan:
                 stage_name = "2辺共有補正" if is_boundary else "CCS補正"
                 if not is_boundary:
                     with st.expander("CCS補正設定"):
-                        ccs_iterations = st.number_input("CCS最大反復数", min_value=1, max_value=30, value=5, step=1, key="ccs_iterations")
+                        ccs_iterations = st.number_input("CCS最大反復数", min_value=1, max_value=30, value=1, step=1, key="ccs_iterations")
                 try:
                     source = refinement_input(state, stage_key)
                     input_label = "分割直後" if source is segmentation else STAGE_LABELS[REFINEMENT_ORDERS[order][0]]
@@ -279,7 +279,7 @@ if plan:
         if "parts.npz" in artifacts:
             st.divider()
             st.subheader("パーツ編集")
-            st.caption("各パーツの倍率とX/Y/Z移動量を編集します。倍率1.00・移動量0が元の形状です。")
+            st.caption("各パーツの倍率と3方向の移動量を編集します。倍率1.00・移動量0が元の形状です。")
             try:
                 render_part_editor(result, artifacts["parts.npz"], up_dir)
                 editor_present = True

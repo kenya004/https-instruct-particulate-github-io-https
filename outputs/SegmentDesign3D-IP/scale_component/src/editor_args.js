@@ -1,4 +1,6 @@
 import { normalizeBlending } from "./boundary_blending.js";
+import { normalizeMovementFrames } from "./translation_frames.js";
+import { normalizeOverlapFaces } from "./overlap_highlights.js";
 
 function record(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -47,6 +49,10 @@ export function normalizeEditorArgs(value) {
     connections: Array.isArray(rawLayout.connections) ? rawLayout.connections : [],
     attachments: Array.isArray(rawLayout.attachments) ? rawLayout.attachments : [] };
   return { ...args, scales, offsets, movement, layout, blending: normalizeBlending(args.blending, args.parts),
+    movement_frames: normalizeMovementFrames(args.movement_frames, args.parts), movement_key: args.movement_key ?? "input_xyz",
+    show_movement_axes: args.show_movement_axes === true,
+    overlap_faces: normalizeOverlapFaces(args.overlap_faces, args.parts), show_overlaps: args.show_overlaps === true,
+    overlap_status: typeof args.overlap_status === "string" ? args.overlap_status : "",
     blending_key: args.blending_key ?? "legacy",
     source_key: args.source_key,
     sequence: Number.isInteger(args.sequence) && args.sequence >= 0 ? args.sequence : 0,

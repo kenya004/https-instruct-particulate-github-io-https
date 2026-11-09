@@ -256,7 +256,7 @@ class BoundaryInterfaceTests(unittest.TestCase):
         app.radio[0].set_value("分割直後").run()
         with patch.object(BackendClient, "refine_ccs", return_value=ccs) as refine_ccs, patch.object(BackendClient, "download_artifact", side_effect=lambda result, filename: ccs_files[filename]):
             app.button(key="refine_ccs").click().run()
-        refine_ccs.assert_called_once_with(boundary, {"max_iterations": 5})
+        refine_ccs.assert_called_once_with(boundary, {"max_iterations": 1})
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(app.radio[0].options, ["分割直後", "2辺共有補正後", "CCS補正後"])
         for name, result in (("分割直後", original), ("2辺共有補正後", boundary), ("CCS補正後", ccs)):
@@ -276,7 +276,7 @@ class BoundaryInterfaceTests(unittest.TestCase):
         reverse_ccs = {**ccs, "segmentation_id": "1" * 32, "parent_segmentation_id": original["segmentation_id"]}
         with patch.object(BackendClient, "refine_ccs", return_value=reverse_ccs) as refine_ccs, patch.object(BackendClient, "download_artifact", side_effect=lambda result, filename: ccs_files[filename]):
             app.button(key="refine_ccs").click().run()
-        refine_ccs.assert_called_once_with(original, {"max_iterations": 5})
+        refine_ccs.assert_called_once_with(original, {"max_iterations": 1})
         reverse_boundary = {**boundary, "segmentation_id": "2" * 32, "parent_segmentation_id": reverse_ccs["segmentation_id"]}
         with patch.object(BackendClient, "refine_boundary", return_value=reverse_boundary) as refine_boundary, patch.object(BackendClient, "download_artifact", side_effect=lambda result, filename: boundary_files[filename]):
             app.button(key="refine_boundary").click().run()

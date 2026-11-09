@@ -12,6 +12,7 @@ import trimesh
 MIN_SCALE = 0.1
 MAX_SCALE = 3.0
 SCALE_STEP = 0.01
+EDITING_PROTOCOL = 2
 
 
 @dataclass(frozen=True)
@@ -97,7 +98,8 @@ def translation_controls(parts: tuple[EditablePart, ...]) -> dict[str, float]:
     return {"limit": limit, "step": limit / 1000}
 
 
-def validate_offsets(parts: tuple[EditablePart, ...], values: dict, *, limit: float | None = None) -> dict[str, list[float]]:
+def validate_offsets(parts: tuple[EditablePart, ...], values: dict, *, limit: float | None = None,
+                     movement_frames=None, previous_offsets=None) -> dict[str, list[float]]:
     if not isinstance(values, dict) or set(values) != {str(part.part_id) for part in parts}:
         raise ValueError("移動量とパーツIDの対応が不正です。")
     result = {}
@@ -105,8 +107,15 @@ def validate_offsets(parts: tuple[EditablePart, ...], values: dict, *, limit: fl
         value = values[str(part.part_id)]
         if not isinstance(value, (list, tuple)) or len(value) != 3 or any(type(item) not in (int, float) or not math.isfinite(item) for item in value):
             raise ValueError("移動量にはX・Y・Zの有限な数値を指定してください。")
-        if limit is not None and any(abs(item) > limit * (1 + 1e-12) for item in value):
-            raise ValueError("移動量がスライダーの範囲外です。")
+        if limit is not None:
+            basis = np.asarray(movement_frames[str(part.part_id)]["basis"]) if movement_frames is not None else np.eye(3)
+            coordinates = basis @ value
+            bounds = np.full(3, limit)
+            if previous_offsets is not None:
+                # Changing the frame must retain an already edited position.
+                bounds = np.maximum(bounds, np.abs(basis @ previous_offsets[str(part.part_id)]))
+            if np.any(np.abs(coordinates) > bounds * (1 + 1e-12)):
+                raise ValueError("移動量がスライダーの範囲外です。")
         if not len(part.faces) and any(item != 0 for item in value):
             raise ValueError("面のないパーツは移動できません。")
         result[str(part.part_id)] = [float(item) for item in value]
@@ -123,7 +132,7 @@ def editor_source_key(manifest: dict, content: bytes) -> str:
     return hashlib.sha256(identity.encode() + b":" + content).hexdigest()
 
 
-def synchronize_editor(state: dict, source_key: str, parts: tuple[EditablePart, ...], event=None) -> dict:
+def synchronize_editor(state: dict, source_key: str, parts: tuple[EditablePart, ...], event=None, *, movement_frames=None) -> dict:
     if state.get("source_key") != source_key:
         state.clear()
         state.update(source_key=source_key, scales={str(part.part_id): 1.0 for part in parts}, sequence=0)
@@ -139,7 +148,8 @@ def synchronize_editor(state: dict, source_key: str, parts: tuple[EditablePart, 
             raise ValueError("編集イベントの順序が不正です。")
         if sequence > state["sequence"]:
             scales = validate_scales(parts, event.get("scales"))
-            offsets = validate_offsets(parts, event.get("offsets", state["offsets"]), limit=translation_controls(parts)["limit"])
+            offsets = validate_offsets(parts, event.get("offsets", state["offsets"]), limit=translation_controls(parts)["limit"],
+                                       movement_frames=movement_frames, previous_offsets=state["offsets"] if movement_frames is not None else None)
             state.update(scales=scales, offsets=offsets, sequence=sequence)
     return state
 
