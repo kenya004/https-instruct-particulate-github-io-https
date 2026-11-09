@@ -10,11 +10,14 @@ import streamlit as st
 from ui_modules import refresh_ui_modules
 
 import backend_client
+import connections
 
 # Upgrade the older client once without reloading its class on every rerun.
 if not hasattr(backend_client.BackendClient, "refine_boundary"):
     importlib.reload(backend_client)
-refresh_ui_modules(names=("workflow", "viewer", "part_editor"))
+if "boundary_edges" not in connections.Connection.__dataclass_fields__:
+    importlib.reload(connections)
+refresh_ui_modules(names=("workflow", "boundary_blending", "rejoining", "viewer", "part_editor"))
 
 from backend_client import BackendClient, BackendError
 from part_editor import render_part_editor

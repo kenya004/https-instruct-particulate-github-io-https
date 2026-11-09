@@ -4,6 +4,7 @@ import { Streamlit } from "streamlit-component-lib";
 import { createIcons, RotateCcw, Focus } from "lucide";
 import { solveTranslations, transformedAnchor } from "./connection_solver.js";
 import { normalizeEditorArgs } from "./editor_args.js";
+import { affineTransforms, sampledAnchor, writeBlendedPositions } from "./boundary_blending.js";
 
 const viewport = document.getElementById("viewport");
 const sliderList = document.getElementById("sliders");
@@ -25,6 +26,8 @@ let grid = null;
 let partData = [];
 let layout = { connections: [], attachments: [] };
 let layoutKey = null;
+let blending = { parts: {}, anchors: {} };
+let blendingKey = null;
 let following = false;
 let showAnchors = false;
 let anchorGeometry = null;
@@ -99,19 +102,39 @@ function keepInFrame() {
 }
 
 function updatePreview() {
-  const translations = solveTranslations(partData, scales, following ? layout.attachments : [], offsets);
+  const automatic = solveTranslations(partData, scales, following ? layout.attachments : []);
+  const translations = Object.fromEntries(partData.map(part => {
+    const id = String(part.part_id);
+    return [id, automatic[id].map((value, axis) => value + offsets[id][axis])];
+  }));
+  const transforms = affineTransforms(partData, scales, automatic);
   const byId = new Map(partData.map(part => [part.part_id, part]));
   for (const part of partData) {
     const mesh = meshes.get(String(part.part_id));
     if (!mesh) continue;
-    mesh.scale.setScalar(scales[String(part.part_id)]);
-    mesh.position.set(...part.center).add(new THREE.Vector3(...translations[String(part.part_id)])).sub(sceneCenter);
+    const id = String(part.part_id), spec = blending.parts[id];
+    if (spec) {
+      const positions = mesh.geometry.getAttribute("position");
+      writeBlendedPositions(part, transforms, spec, positions.array);
+      positions.needsUpdate = true;
+      mesh.geometry.computeVertexNormals();
+      mesh.geometry.computeBoundingBox();
+      mesh.geometry.computeBoundingSphere();
+      mesh.scale.setScalar(1);
+      mesh.position.set(...part.center).add(new THREE.Vector3(...offsets[id])).sub(sceneCenter);
+    } else {
+      mesh.scale.setScalar(scales[id]);
+      mesh.position.set(...part.center).add(new THREE.Vector3(...translations[id])).sub(sceneCenter);
+    }
   }
   if (anchorGeometry) {
     const positions = anchorGeometry.getAttribute("position");
     const colors = anchorGeometry.getAttribute("color");
     for (const [index, connection] of layout.connections.entries()) {
-      const ends = [connection.part_a, connection.part_b].map(id => transformedAnchor(byId.get(id), scales[String(id)], connection.anchor, translations[String(id)]));
+      const samples = blending.anchors[String(connection.connection_id)];
+      const ends = samples
+        ? samples.map(sample => sampledAnchor(sample, byId, transforms, blending, offsets))
+        : [connection.part_a, connection.part_b].map(id => transformedAnchor(byId.get(id), scales[String(id)], connection.anchor, translations[String(id)]));
       const distance = new THREE.Vector3(...ends[0]).distanceTo(new THREE.Vector3(...ends[1]));
       const color = new THREE.Color(distance <= sceneExtent * 1e-7 ? 0x087863 : 0xdb6032);
       for (let side = 0; side < 2; side += 1) {
@@ -173,6 +196,8 @@ function rebuild(args) {
   partData = args.parts;
   layout = args.layout;
   layoutKey = args.layout_key;
+  blending = args.blending;
+  blendingKey = args.blending_key;
   following = args.follow;
   showAnchors = args.show_anchors;
   widgets.clear();
@@ -369,13 +394,14 @@ new ResizeObserver(resize).observe(document.getElementById("workspace"));
 Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
   try {
     const args = normalizeEditorArgs(event.detail?.args);
-    if (args.source_key !== sourceKey) rebuild(args);
+    if (args.source_key !== sourceKey || args.blending_key !== blendingKey) rebuild(args);
     else {
       const layoutChanged = layoutKey !== args.layout_key;
       layout = args.layout;
       layoutKey = args.layout_key;
       following = args.follow;
       showAnchors = args.show_anchors;
+      blending = args.blending;
       if (!dragging && Number(args.sequence) >= sequence) {
         sequence = Number(args.sequence);
         for (const [id, value] of Object.entries(args.scales)) updateScale(id, Number(value), false);

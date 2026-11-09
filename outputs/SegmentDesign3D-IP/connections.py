@@ -17,6 +17,7 @@ class Connection:
     anchor: np.ndarray
     boundary_length: float
     edge_count: int
+    boundary_edges: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,8 @@ def detect_connections(content: bytes, parts: tuple[EditablePart, ...]) -> tuple
                 continue
             anchor = np.sum(segments.mean(axis=1) * (lengths / total)[:, None], axis=0)
             anchor.setflags(write=False)
-            connections.append(Connection(len(connections), left, right, anchor, total, len(component)))
+            connections.append(Connection(len(connections), left, right, anchor, total, len(component),
+                                          tuple((int(a), int(b)) for a, b in component)))
     return tuple(connections), warnings
 
 

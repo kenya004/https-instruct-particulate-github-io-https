@@ -1,3 +1,5 @@
+import { normalizeBlending } from "./boundary_blending.js";
+
 function record(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
@@ -44,7 +46,8 @@ export function normalizeEditorArgs(value) {
   const layout = { ...rawLayout,
     connections: Array.isArray(rawLayout.connections) ? rawLayout.connections : [],
     attachments: Array.isArray(rawLayout.attachments) ? rawLayout.attachments : [] };
-  return { ...args, scales, offsets, movement, layout,
+  return { ...args, scales, offsets, movement, layout, blending: normalizeBlending(args.blending, args.parts),
+    blending_key: args.blending_key ?? "legacy",
     source_key: args.source_key,
     sequence: Number.isInteger(args.sequence) && args.sequence >= 0 ? args.sequence : 0,
     layout_key: args.layout_key ?? JSON.stringify(layout),
