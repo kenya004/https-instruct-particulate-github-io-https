@@ -65,7 +65,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
     for warning in blending["warnings"]:
         st.warning(warning)
     movement = translation_controls(parts)
-    st.caption(f"X/Y/Z移動：入力モデルの座標軸・座標単位。各軸の範囲 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
+    st.caption(f"X/Y/Z移動：入力モデルの座標軸・座標単位。表示の上方向は入力の{up_dir}です。各軸の範囲 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
     event = _component(
         source_key=source_key, parts=editor_payload(parts), scales=state["scales"],
         editor_protocol=3, blending=blending,
@@ -127,7 +127,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         st.caption(f"Mesh数：1 / 連結成分：{statistics['connected_components']} / 元の面：{statistics['original_faces']} / 追加した接続面：{statistics['bridge_faces']} / 統合した頂点：{statistics['welded_vertices']}")
         if statistics["ambiguous_edges"]:
             st.caption(f"3面以上が共有する境界エッジ{statistics['ambiguous_edges']}本は、橋渡し面の自動生成から除外しました。")
-        st.plotly_chart(mesh_figure([rejoined_payload(joined)], up_dir=up_dir), width="stretch", key=f"rejoined_view_{revision}", config=mesh_viewer_config())
+        st.plotly_chart(mesh_figure([rejoined_payload(joined)], up_dir=up_dir), width="stretch", key=f"rejoined_view_{revision}_{up_dir}", config=mesh_viewer_config())
         st.download_button("結合後 GLB", saved["glb"], file_name=f"{result['segmentation_id']}_rejoined.glb",
                            mime="model/gltf-binary", key="download_rejoined_glb", icon=":material/download:")
         st.download_button("結合後 NPZ", saved["npz"], file_name=f"{result['segmentation_id']}_rejoined.npz",

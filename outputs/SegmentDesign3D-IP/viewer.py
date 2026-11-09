@@ -6,6 +6,8 @@ import numpy as np
 import plotly.graph_objects as go
 import trimesh
 
+from orientation import CAMERA_EYE, display_axis_titles, orient_bounds, orient_points
+
 
 def load_mesh_payloads(content: bytes) -> list[dict]:
     scene = trimesh.load(io.BytesIO(content), file_type="glb", process=False)
@@ -67,7 +69,7 @@ def mesh_viewer_config() -> dict:
 def mesh_figure(meshes: list[dict], *, up_dir: str, height: int = 430, bounds=None) -> go.Figure:
     traces = []
     for mesh in meshes:
-        points = np.asarray(mesh["vertices"], dtype=np.float64)
+        points = orient_points(mesh["vertices"], up_dir)
         triangles = np.asarray(list(iter_triangle_faces(mesh["faces"])), dtype=np.int64)
         traces.append(go.Mesh3d(
             x=points[:, 0], y=points[:, 1], z=points[:, 2],
@@ -81,18 +83,20 @@ def mesh_figure(meshes: list[dict], *, up_dir: str, height: int = 430, bounds=No
         gridcolor="rgba(107,114,128,0.20)", showline=True, linecolor="#adb4b8",
         tickfont=dict(size=10, color="#5a6369"), nticks=5, showspikes=False,
     )
-    up = {"x": 0, "y": 0, "z": 0}
-    up[up_dir[-1].lower()] = -1 if up_dir.startswith("-") else 1
     figure = go.Figure(traces)
-    axes = {name: dict(title=name.upper(), **axis) for name in ("x", "y", "z")}
+    axes = {name: dict(title=title, **axis) for name, title in zip("xyz", display_axis_titles(up_dir))}
     if bounds is not None:
-        lower, upper = np.asarray(bounds)
+        lower, upper = orient_bounds(bounds, up_dir)
         padding = max(float((upper - lower).max()) * 0.05, 1e-6)
         for index, name in enumerate(("x", "y", "z")):
             axes[name]["range"] = [float(lower[index] - padding), float(upper[index] + padding)]
     figure.update_layout(
         height=height, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="white",
-        uirevision=f"turntable:{up_dir}",
-        scene=dict(dragmode="turntable", aspectmode="data", xaxis=axes["x"], yaxis=axes["y"], zaxis=axes["z"], camera=dict(up=up)),
+        uirevision=f"z-up-v1:{up_dir}",
+        scene=dict(
+            dragmode="turntable", aspectmode="data", xaxis=axes["x"], yaxis=axes["y"], zaxis=axes["z"],
+            uirevision=f"z-up-v1:{up_dir}",
+            camera=dict(up=dict(x=0, y=0, z=1), eye=CAMERA_EYE, center=dict(x=0, y=0, z=0)),
+        ),
     )
     return figure

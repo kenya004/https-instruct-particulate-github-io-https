@@ -52,7 +52,7 @@ python -m venv .venv
 ## 操作
 
 1. GLBを選択する。入力したモデルが右側に表示されます。
-2. モデルの上方向を選ぶ。
+2. GLB内で物体の上に向かう軸を「モデルの上方向」で選ぶ。選択した軸を上に向けて、入力・分割・編集・結合の全ビューを表示します。方向を変えたら「パーツ構成を作成」から再実行します。
 3. どのように編集したいかを文章で入力する。
 4. 「パーツ構成を作成」を押す。
 5. 物体名と、分割用の英語パーツ名・編集対象を確認する。UIのパーツ名にはInstruct-Particulateへ渡す`name`をそのまま使用します。
@@ -85,6 +85,7 @@ backend_client.py   WSLのAPIへの通信
 workflow.py         登録→名前推定→パーツ構成と、確認後の分割・結果取得の状態管理
 editing.py          パーツ読込・中心計算・スケーリング・XYZ移動・編集後GLB出力
 connections.py      接続境界の検出・接続グラフの作成・平行移動による追従
+orientation.py/json 推論と同じ上方向への表示回転（Plotly・Three.jsで共通）
 boundary_blending.py 元の共有境界からの距離・なじませ重み・Python側の局所変形
 rejoining.py        元頂点対応を使った境界の橋渡し・色付きMeshの結合と出力
 part_editor.py      Streamlitの編集状態とブラウザ側コンポーネントの接続

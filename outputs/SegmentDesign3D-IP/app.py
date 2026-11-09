@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib
+import hashlib
 import os
 
 import numpy as np
@@ -10,14 +11,17 @@ import streamlit as st
 from ui_modules import refresh_ui_modules
 
 import backend_client
+import editing
 import connections
 
 # Upgrade the older client once without reloading its class on every rerun.
 if not hasattr(backend_client.BackendClient, "refine_boundary"):
     importlib.reload(backend_client)
+if not all(hasattr(editing, name) for name in ("translate_parts", "translation_controls")):
+    importlib.reload(editing)
 if "boundary_edges" not in connections.Connection.__dataclass_fields__:
     importlib.reload(connections)
-refresh_ui_modules(names=("workflow", "boundary_blending", "rejoining", "viewer", "part_editor"))
+refresh_ui_modules(names=("workflow", "orientation", "boundary_blending", "rejoining", "viewer", "part_editor"))
 
 from backend_client import BackendClient, BackendError
 from part_editor import render_part_editor
@@ -58,12 +62,15 @@ with left:
     st.subheader("入力")
     uploaded = st.file_uploader("GLBモデル", type=["glb"], key="model_file")
     up_dir = st.selectbox("モデルの上方向", ["+Z", "-Z", "+Y", "-Y", "+X", "-X"], key="up_dir")
+    st.caption("GLB内で物体の上に向かう軸を選びます。入力・分割・編集・結合の表示で、その方向を上へ向けます。")
     request = st.text_area("編集要求", height=170, max_chars=4000, key="edit_request")
 
 content = uploaded.getvalue() if uploaded is not None else None
+current_identity = input_identity(uploaded.name, content, up_dir, base_url) if content is not None else None
+view_key = hashlib.sha256(current_identity.encode()).hexdigest()[:16] if current_identity is not None else "empty"
 if content is None:
     state.clear()
-elif state.get("input_identity") != input_identity(uploaded.name, content, up_dir, base_url):
+elif state.get("input_identity") != current_identity:
     state.clear()
 if state.get("plan") and state["plan"].get("edit_request") != request.strip():
     state.pop("plan", None)
@@ -103,7 +110,7 @@ with left:
 with right:
     st.subheader("入力モデル")
     if meshes:
-        st.plotly_chart(mesh_figure(meshes, up_dir=up_dir), width="stretch", config=mesh_viewer_config())
+        st.plotly_chart(mesh_figure(meshes, up_dir=up_dir), width="stretch", key=f"input_view_{view_key}", config=mesh_viewer_config())
     else:
         with st.container(height=430, border=False):
             st.caption("未選択")
@@ -262,7 +269,7 @@ if plan:
                     if visible:
                         vertices = np.concatenate([np.asarray(mesh["vertices"]) for mesh in split_meshes])
                         bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)])
-                        st.plotly_chart(mesh_figure(visible, up_dir=up_dir, bounds=bounds), width="stretch", key="segmentation_view", config=mesh_viewer_config())
+                        st.plotly_chart(mesh_figure(visible, up_dir=up_dir, bounds=bounds), width="stretch", key=f"segmentation_view_{view_key}", config=mesh_viewer_config())
                     else:
                         st.warning("このパーツに割り当てられた面はありません。")
                 except Exception as error:

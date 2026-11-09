@@ -68,7 +68,9 @@ class WorkflowTests(unittest.TestCase):
         vertices = np.asarray(meshes[0]["vertices"])
         self.assertAlmostEqual(vertices[:, 0].min(), 9.5)
         figure = mesh_figure(meshes, up_dir="-Y")
-        self.assertEqual(figure.layout.scene.camera.up.y, -1)
+        self.assertEqual(figure.layout.scene.camera.up.z, 1)
+        np.testing.assert_array_equal(figure.data[0].y, vertices[:, 2])
+        np.testing.assert_array_equal(figure.data[0].z, -vertices[:, 1])
         self.assertEqual(figure.layout.scene.dragmode, "turntable")
         self.assertGreater(len(figure.data[0].i), 0)
 

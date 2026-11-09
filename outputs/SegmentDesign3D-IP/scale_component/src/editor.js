@@ -5,6 +5,7 @@ import { createIcons, RotateCcw, Focus } from "lucide";
 import { solveTranslations, transformedAnchor } from "./connection_solver.js";
 import { normalizeEditorArgs } from "./editor_args.js";
 import { affineTransforms, sampledAnchor, writeBlendedPositions } from "./boundary_blending.js";
+import { applyDisplayOrientation, CAMERA_EYE, DISPLAY_UP, sourceToDisplay } from "./orientation.js";
 
 const viewport = document.getElementById("viewport");
 const sliderList = document.getElementById("sliders");
@@ -28,13 +29,14 @@ let layout = { connections: [], attachments: [] };
 let layoutKey = null;
 let blending = { parts: {}, anchors: {} };
 let blendingKey = null;
+let viewUpDir = null;
 let following = false;
 let showAnchors = false;
 let anchorGeometry = null;
 let anchorPoints = null;
 let anchorLines = null;
 let sceneExtent = 1;
-let renderer, scene, camera, orbit, group;
+let renderer, scene, camera, orbit, group, displayRoot;
 
 createIcons({ icons: { RotateCcw, Focus } });
 
@@ -65,7 +67,9 @@ try {
     scene.add(light);
   }
   group = new THREE.Group();
-  scene.add(group);
+  displayRoot = new THREE.Group();
+  displayRoot.add(group);
+  scene.add(displayRoot);
   camera.position.set(3, -4, 3);
 } catch (error) {
   showError(error);
@@ -73,7 +77,7 @@ try {
 
 function fitView() {
   if (!renderer || !orbit || !meshes.size) return;
-  group.updateMatrixWorld(true);
+  group.updateWorldMatrix(true, true);
   const box = new THREE.Box3().setFromObject(group);
   const center = box.getCenter(new THREE.Vector3());
   const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-8);
@@ -95,7 +99,7 @@ function fitView() {
 
 function keepInFrame() {
   if (!renderer || !orbit || !meshes.size) return;
-  group.updateMatrixWorld(true);
+  group.updateWorldMatrix(true, true);
   const bounds = new THREE.Box3().setFromObject(group);
   const radius = bounds.getSize(new THREE.Vector3()).length() / 2;
   if (radius + bounds.getCenter(new THREE.Vector3()).distanceTo(orbit.target) > cameraRadius * 1.25) fitView();
@@ -198,6 +202,7 @@ function rebuild(args) {
   layoutKey = args.layout_key;
   blending = args.blending;
   blendingKey = args.blending_key;
+  viewUpDir = args.up_dir;
   following = args.follow;
   showAnchors = args.show_anchors;
   widgets.clear();
@@ -209,7 +214,7 @@ function rebuild(args) {
   }
   meshes.clear();
   if (anchorGeometry) {
-    scene.remove(anchorPoints, anchorLines);
+    displayRoot.remove(anchorPoints, anchorLines);
     anchorGeometry.dispose();
     anchorPoints.material.dispose();
     anchorLines.material.dispose();
@@ -226,13 +231,12 @@ function rebuild(args) {
     for (const point of part.vertices) bounds.expandByPoint(new THREE.Vector3(...point));
   }
   sceneCenter = bounds.getCenter(new THREE.Vector3());
-  const up = new THREE.Vector3();
-  up[args.up_dir.slice(-1).toLowerCase()] = args.up_dir.startsWith("-") ? -1 : 1;
+  const rotation = sourceToDisplay(args.up_dir);
+  const up = new THREE.Vector3(...DISPLAY_UP);
+  if (displayRoot) applyDisplayOrientation(displayRoot, args.up_dir);
   if (camera) {
     camera.up.copy(up);
-    const right = Math.abs(up.x) > 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
-    const back = new THREE.Vector3().crossVectors(right, up).normalize();
-    camera.position.copy(right).multiplyScalar(3).addScaledVector(back, 4).addScaledVector(up, 3);
+    camera.position.set(...CAMERA_EYE);
     orbit?.dispose();
     orbit = createTurntableControls(camera, renderer.domElement, up);
     orbit.addEventListener("change", () => { dirty = true; });
@@ -348,13 +352,13 @@ function rebuild(args) {
       anchorLines = new THREE.LineSegments(anchorGeometry, new THREE.LineBasicMaterial({ vertexColors: true, depthTest: false, depthWrite: false }));
       anchorPoints.renderOrder = 21;
       anchorLines.renderOrder = 20;
-      scene.add(anchorPoints, anchorLines);
+      displayRoot.add(anchorPoints, anchorLines);
     }
     grid = new THREE.GridHelper(extent * 1.6, 12, 0xc5d3d8, 0xe4e9ec);
     grid.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), up);
     let minimum = Infinity;
     for (const part of args.parts) {
-      for (const point of part.vertices) minimum = Math.min(minimum, new THREE.Vector3(...point).sub(sceneCenter).dot(up));
+      for (const point of part.vertices) minimum = Math.min(minimum, new THREE.Vector3(...point).sub(sceneCenter).applyMatrix4(rotation).z);
     }
     grid.position.copy(up).multiplyScalar(minimum - extent * 0.015);
     scene.add(grid);
@@ -394,7 +398,7 @@ new ResizeObserver(resize).observe(document.getElementById("workspace"));
 Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
   try {
     const args = normalizeEditorArgs(event.detail?.args);
-    if (args.source_key !== sourceKey || args.blending_key !== blendingKey) rebuild(args);
+    if (args.source_key !== sourceKey || args.blending_key !== blendingKey || args.up_dir !== viewUpDir) rebuild(args);
     else {
       const layoutChanged = layoutKey !== args.layout_key;
       layout = args.layout;
