@@ -1,5 +1,6 @@
 from pathlib import Path
 import hashlib
+import io
 
 import streamlit as st
 import numpy as np
@@ -9,7 +10,7 @@ from editing import editor_payload, editor_source_key, export_edited_glb, load_e
 from connections import build_connection_plan, connection_payload, connection_residuals, detect_connections, follow_connections
 from boundary_blending import apply_boundary_blend, blend_metadata, blended_anchor_residuals, build_boundary_blend
 from movement_axes import build_movement_frames
-from mesh_overlaps import METHOD as OVERLAP_METHOD, assemble_parts, find_face_overlaps, part_face_ids
+from mesh_overlaps import METHOD as OVERLAP_METHOD, assemble_parts, find_face_overlaps, only_new_overlaps, overlap_frame, part_face_ids
 from rejoining import export_rejoined_glb, export_rejoined_npz, has_rejoin_data, rejoin_input_key, rejoin_parts, rejoined_payload
 from viewer import mesh_figure, mesh_viewer_config
 
@@ -40,15 +41,33 @@ def _load_frames(content, manifest, up_dir, selected, enabled):
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def _check_overlaps(signature, _vertices, _faces):
-    return find_face_overlaps(_vertices, _faces)
+def _check_overlaps(signature, _vertices, _faces, _frame):
+    return find_face_overlaps(_vertices, _faces, frame=_frame)
 
 
-def _overlaps(vertices, faces):
+def _overlaps(vertices, faces, frame=None):
     # Hash every coordinate: sampled hashes could miss small local edits.
+    frame = overlap_frame(vertices) if frame is None else frame
+    frame_bytes = np.asarray([*frame["origin"], frame["scale"]], dtype=np.float64).tobytes()
     schema = repr((vertices.shape, vertices.dtype.str, faces.shape, faces.dtype.str)).encode()
-    signature = hashlib.sha256(OVERLAP_METHOD.encode() + schema + vertices.tobytes() + faces.tobytes()).hexdigest()
-    return _check_overlaps(signature, vertices, faces)
+    signature = hashlib.sha256(OVERLAP_METHOD.encode() + frame_bytes + schema + vertices.tobytes() + faces.tobytes()).hexdigest()
+    return _check_overlaps(signature, vertices, faces, frame)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _reference_overlaps(content, manifest, method):
+    parts, _, _, can_rejoin = _load(content, manifest, 2)
+    vertices, faces, _ = assemble_parts(parts)
+    report = _overlaps(vertices, faces)
+    source_face_ids = None
+    if can_rejoin:
+        with np.load(io.BytesIO(content), allow_pickle=False) as data:
+            ids = []
+            for record in manifest["parts"]:
+                prefix = record.get("npz_prefix", f"part_{record['part_id']:04d}")
+                ids.append(data[f"{prefix}_source_face_indices"])
+            source_face_ids = np.concatenate(ids)
+    return report, source_face_ids
 
 
 def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
@@ -101,7 +120,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
             st.warning(frame["warning"])
     show_axes = st.checkbox("移動軸を表示", value=True, key=f"movement_axes_show_{source_key}")
     show_overlaps = st.checkbox("Faceの重なりを表示", value=True, key=f"show_overlaps_{source_key}")
-    st.caption("重なるFaceを赤く表示します。判定はスライダーを離した後に更新します。編集は制限せず、保存するモデルは元のパーツ色を保持します。")
+    st.caption("未編集時にはない新しい交差ペアのFaceだけを赤く表示します。判定はスライダーを離した後に更新します。編集は制限せず、保存するモデルは元のパーツ色を保持します。")
     movement = translation_controls(parts)
     st.caption(f"移動は接触を維持しません。軸の矢印は赤＝U、緑＝V、青＝N。断面がないパーツは入力XYZです。入力座標の単位で各軸 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
     if follow and connections:
@@ -109,7 +128,12 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
     else:
         edited = scale_parts(parts, state["scales"])
         automatic = {part.part_id: np.zeros(3) for part in parts}
+    uniform_parts = edited
     edited = apply_boundary_blend(parts, edited, state["scales"], automatic, blending)
+    # Exclude internal pairs only when local blending actually left the part
+    # identical to its uniformly scaled/translated geometry.
+    uniform_ids = {part.part_id for part, uniform in zip(edited, uniform_parts)
+                   if np.array_equal(part.vertices, uniform.vertices)}
     # Manual offsets are applied after the whole attachment tree is solved; they never propagate.
     edited = translate_parts(edited, state["offsets"])
     translations = {part.part_id: automatic[part.part_id] + state["offsets"][str(part.part_id)] for part in parts}
@@ -125,13 +149,18 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
                 "anchor_residuals": {str(index): value for index, value in residuals.items()},
                 "boundary_blending": blend_info, "movement_frames": frames}
     overlap_report, overlap_faces = None, {}
+    reference_report, reference_face_ids = None, None
     if show_overlaps:
         vertices, faces, slices = assemble_parts(edited)
+        uniform_groups = np.concatenate([np.full(len(part.faces), part.part_id if part.part_id in uniform_ids else -1,
+                                                dtype=np.int64) for part in parts])
         with st.spinner("Faceの重なりを検査しています"):
-            overlap_report = _overlaps(vertices, faces)
+            reference_report, reference_face_ids = _reference_overlaps(content, result, OVERLAP_METHOD)
+            overlap_report = only_new_overlaps(_overlaps(vertices, faces, reference_report["frame"]), reference_report,
+                                               uniform_groups=uniform_groups)
         overlap_faces = part_face_ids(overlap_report, slices)
         count = len(overlap_report["face_ids"])
-        st.caption(f"重なるFace：{count}面 / {overlap_report['pair_count']}組。赤いFaceを確認し、必要に応じて移動や倍率を調整してください。")
+        st.caption(f"新しく重なるFace：{count}面 / {overlap_report['pair_count']}組。未編集時の交差ペアは表示から除外しています。")
     state.update(edited_parts=edited, connections=metadata, overlap_report=overlap_report)
     sequence_before = state["sequence"]
     event = _component(
@@ -140,7 +169,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         movement_key=f"{frame_mode}:{sorted(choices.items())}",
         blending_key=f"{root_id}:{sorted(selected)}:{percent}",
         offsets=state["offsets"], movement=movement, show_overlaps=show_overlaps, overlap_faces=overlap_faces,
-        overlap_status=(f"重なるFace：{len(overlap_report['face_ids'])}面 / {overlap_report['pair_count']}組" if overlap_report else "重なり表示はオフです"),
+        overlap_status=(f"新しく重なるFace：{len(overlap_report['face_ids'])}面 / {overlap_report['pair_count']}組" if overlap_report else "重なり表示はオフです"),
         layout=layout, follow=bool(follow and connections), show_anchors=bool(show_anchors and connections),
         layout_key=f"{root_id}:{bool(follow)}:{bool(show_anchors)}",
         sequence=state["sequence"], up_dir=up_dir, default=None, key=f"part_scale_move_{source_key}",
@@ -182,12 +211,24 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         payload = rejoined_payload(joined)
         if show_overlaps:
             with st.spinner("結合後のFaceの重なりを検査しています"):
-                report = _overlaps(np.asarray(joined.mesh.vertices), np.asarray(joined.mesh.faces))
+                face_keys = np.where(joined.source_face_indices >= 0, joined.source_face_indices, -1 - np.arange(len(joined.mesh.faces)))
+                joined_vertices, joined_faces = np.asarray(joined.mesh.vertices), np.asarray(joined.mesh.faces)
+                joined_groups = np.full(len(joined_faces), -1, dtype=np.int64)
+                original_ids = np.flatnonzero(joined.source_face_indices >= 0)
+                assembled_ids = np.argsort(reference_face_ids)[joined.source_face_indices[original_ids]]
+                # Welding can move original vertices slightly. Only retain the
+                # uniform exemption for faces whose coordinates stayed exact;
+                # all changed originals and all new bridge faces are checked.
+                preserved = np.all(joined_vertices[joined_faces[original_ids]] == vertices[faces[assembled_ids]], axis=(1, 2))
+                joined_groups[original_ids[preserved]] = uniform_groups[assembled_ids[preserved]]
+                report = only_new_overlaps(_overlaps(joined_vertices, joined_faces, reference_report["frame"]),
+                                           reference_report, face_keys=face_keys, reference_face_keys=reference_face_ids,
+                                           uniform_groups=joined_groups)
             saved["overlap_report"] = report
             marked = set(report["face_ids"])
             payload["face_colors"] = ["#e12b35" if index in marked else color for index, color in enumerate(payload["face_colors"])]
             bridges = sum(bool(joined.is_bridge[index]) for index in marked)
-            st.caption(f"結合後の重なるFace：{len(marked)}面（うち追加面：{bridges}面）/ {report['pair_count']}組。表示の赤色は検査用で、出力ファイルの色は保持します。")
+            st.caption(f"結合後の新しく重なるFace：{len(marked)}面（うち追加面：{bridges}面）/ {report['pair_count']}組。未編集時の交差ペアは表示から除外しています。")
         st.plotly_chart(mesh_figure([payload], up_dir=up_dir), width="stretch", key=f"rejoined_view_{revision}_{up_dir}", config=mesh_viewer_config())
         st.download_button("結合後 GLB", saved["glb"], file_name=f"{result['segmentation_id']}_rejoined.glb",
                            mime="model/gltf-binary", key="download_rejoined_glb", icon=":material/download:")

@@ -158,9 +158,11 @@ def follow_connections(parts: tuple[EditablePart, ...], scales: dict, plan: Conn
     for attachment in plan.attachments:
         parent, child = by_id[attachment.parent_id], by_id[attachment.child_id]
         anchor = by_connection[attachment.connection_id].anchor
-        parent_anchor = parent.center + scales[str(parent.part_id)] * (anchor - parent.center) + translations[parent.part_id]
-        child_anchor = child.center + scales[str(child.part_id)] * (anchor - child.center)
-        translations[child.part_id] = parent_anchor - child_anchor
+        # Compare displacements from the same original anchor. Reconstructing
+        # two absolute anchors can introduce a nonzero offset even at scale 1.
+        parent_delta = (scales[str(parent.part_id)] - 1) * (anchor - parent.center) + translations[parent.part_id]
+        child_delta = (scales[str(child.part_id)] - 1) * (anchor - child.center)
+        translations[child.part_id] = parent_delta - child_delta
     edited = scale_parts(parts, scales)
     return tuple(replace(part, vertices=part.vertices + translations[part.part_id]) for part in edited), translations
 
@@ -172,7 +174,7 @@ def connection_residuals(parts: tuple[EditablePart, ...], scales: dict, connecti
         anchors = []
         for part_id in (connection.part_a, connection.part_b):
             part = by_id[part_id]
-            anchors.append(part.center + scales[str(part_id)] * (connection.anchor - part.center) + translations[part_id])
+            anchors.append(connection.anchor + (scales[str(part_id)] - 1) * (connection.anchor - part.center) + translations[part_id])
         residuals[connection.connection_id] = float(np.linalg.norm(anchors[0] - anchors[1]))
     return residuals
 

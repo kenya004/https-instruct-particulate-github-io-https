@@ -4,6 +4,16 @@ import { solveTranslations, transformedAnchor } from '../src/connection_solver.j
 
 const parts = [0, 1, 2].map(part_id => ({part_id, center: [10.5 + part_id, 20, 30]}));
 
+test('unit scales keep original anchors and exactly zero translations near thin boundaries', () => {
+  const parts = [{part_id: 0, center: [.5, .5, .05]}, {part_id: 1, center: [.5, .5, .3000000005]}];
+  const anchor = [.95, 0, 1e-9];
+  for (const [parent_id, child_id] of [[0, 1], [1, 0]]) {
+    const offsets = solveTranslations(parts, {'0': 1, '1': 1}, [{parent_id, child_id, anchor}]);
+    assert.deepEqual(offsets, {'0': [0, 0, 0], '1': [0, 0, 0]});
+    for (const part of parts) assert.deepEqual(transformedAnchor(part, 1, anchor), anchor);
+  }
+});
+
 test('middle root moves both neighbors, root stays fixed', () => {
   const offsets = solveTranslations(parts, {'0': 1, '1': 2, '2': 1}, [
     {parent_id: 1, child_id: 0, anchor: [11, 20, 30]},

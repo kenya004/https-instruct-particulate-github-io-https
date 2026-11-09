@@ -181,7 +181,9 @@ def apply_boundary_blend(parts, baseline, scales, automatic, payload):
         for influence in payload.get("parts", {}).get(str(part.part_id), {}).get("influences", []):
             reference = by_id[influence["reference_part_id"]]
             weights = np.asarray(influence["weights"], dtype=float)
-            target = reference.center + scales[str(reference.part_id)] * (part.vertices - reference.center) + automatic[reference.part_id]
+            # Preserve original coordinates exactly when scale is 1 and the
+            # automatic displacement is 0, including very thin boundaries.
+            target = part.vertices + (scales[str(reference.part_id)] - 1) * (part.vertices - reference.center) + automatic[reference.part_id]
             vertices += weights[:, None] * (target - current.vertices)
         result.append(replace(current, vertices=vertices))
     return tuple(result)
@@ -206,7 +208,8 @@ def blend_metadata(payload, parts, scales, automatic):
         targets = []
         for part_id in check["part_ids"]:
             part = by_id[part_id]
-            targets.append(part.center + scales[str(part_id)] * (np.asarray(check["point"]) - part.center) + automatic[part_id])
+            point = np.asarray(check["point"])
+            targets.append(point + (scales[str(part_id)] - 1) * (point - part.center) + automatic[part_id])
         conflicts += any(np.linalg.norm(point - targets[0]) > tolerance for point in targets[1:])
     return {"method": payload["method"], "selected_ids": payload["selected_ids"], "ratio": payload["ratio"],
             "parts": [{key: value for key, value in item.items() if key != "influences"} for item in payload["parts"].values()],

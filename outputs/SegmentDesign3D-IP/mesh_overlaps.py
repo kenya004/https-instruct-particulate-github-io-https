@@ -9,7 +9,16 @@ from __future__ import annotations
 import numpy as np
 
 
-METHOD = "triangle_bvh_overlap_v1"
+METHOD = "triangle_bvh_overlap_v3"
+
+
+def overlap_frame(vertices):
+    """Keep this original-model frame fixed when checking later edits."""
+    vertices = np.asarray(vertices, dtype=float)
+    if not len(vertices):
+        return {"origin": [0.0, 0.0, 0.0], "scale": 1.0}
+    lower, upper = vertices.min(axis=0), vertices.max(axis=0)
+    return {"origin": ((lower + upper) / 2).tolist(), "scale": float((upper - lower).max()) or 1.0}
 
 
 def _plane_interval(triangles, distances, direction, tolerance):
@@ -76,19 +85,23 @@ def _intersecting_pairs(triangles, normals, pairs, tolerance):
     return pairs[result]
 
 
-def find_face_overlaps(vertices, faces, *, tolerance=1e-9):
+def find_face_overlaps(vertices, faces, *, tolerance=1e-9, frame=None):
     vertices, faces = np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int64)
     if (vertices.ndim != 2 or vertices.shape[1] != 3 or not np.isfinite(vertices).all()
             or faces.ndim != 2 or faces.shape[1] != 3
             or (len(faces) and (faces.min() < 0 or faces.max() >= len(vertices)))):
         raise ValueError("交差検査用の頂点・面が不正です。")
-    report = {"method": METHOD, "face_ids": [], "pair_count": 0, "sample_pairs": [], "tolerance": 0.0}
+    frame = overlap_frame(vertices) if frame is None else frame
+    origin, extent = np.asarray(frame["origin"], dtype=float), float(frame["scale"])
+    if (origin.shape != (3,) or not np.isfinite(origin).all() or not np.isfinite(extent) or extent <= 0
+            or not np.isfinite(tolerance) or tolerance <= 0):
+        raise ValueError("交差検査用の基準座標・許容誤差が不正です。")
+    report = {"method": METHOD, "face_ids": [], "face_count": len(faces), "pair_count": 0,
+              "pairs": np.empty((0, 2), dtype=np.int64), "sample_pairs": [], "tolerance": tolerance * extent,
+              "frame": {"origin": origin.tolist(), "scale": extent}}
     if len(faces) < 2:
         return report
-    extent = float(np.ptp(vertices, axis=0).max())
-    if extent <= 0:
-        return report
-    points = (vertices - (vertices.min(axis=0) + vertices.max(axis=0)) / 2) / extent
+    points = (vertices - origin) / extent
     triangles = points[faces]
     normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
     areas = np.linalg.norm(normals, axis=1)
@@ -115,6 +128,7 @@ def find_face_overlaps(vertices, faces, *, tolerance=1e-9):
     root = build(valid)
     stack, pending, pending_count = [(root, root)], [], 0
     marked = np.zeros(len(faces), dtype=bool)
+    detected = []
 
     def check_pending():
         nonlocal pending_count
@@ -123,6 +137,7 @@ def find_face_overlaps(vertices, faces, *, tolerance=1e-9):
         pairs = _intersecting_pairs(triangles, normals, np.concatenate(pending), tolerance)
         report["pair_count"] += len(pairs)
         if len(pairs):
+            detected.append(pairs)
             marked[pairs.reshape(-1)] = True
             report["sample_pairs"].extend(pairs[:max(0, 100 - len(report["sample_pairs"]))].tolist())
         pending.clear()
@@ -154,8 +169,48 @@ def find_face_overlaps(vertices, faces, *, tolerance=1e-9):
             if pending_count >= 16384:
                 check_pending()
     check_pending()
-    report.update(face_ids=np.flatnonzero(marked).tolist(), tolerance=tolerance * extent)
+    report.update(face_ids=np.flatnonzero(marked).tolist(), tolerance=tolerance * extent,
+                  pairs=np.concatenate(detected) if detected else np.empty((0, 2), dtype=np.int64))
     return report
+
+
+def only_new_overlaps(report, reference, *, face_keys=None, reference_face_keys=None, uniform_groups=None):
+    """Subtract complete unordered face pairs, not faces or truncated samples.
+
+    Keys identify original faces after rejoining/reordering. Newly generated
+    bridge faces must have unique keys absent from the reference mesh.
+    Faces with the same nonnegative uniform group underwent one positive
+    uniform scaling/translation, so cannot develop new internal intersections.
+    Locally deformed or newly generated faces use group -1 and remain checked.
+    """
+    pairs = np.asarray(report["pairs"], dtype=np.int64).reshape(-1, 2)
+    reference_pairs = np.asarray(reference["pairs"], dtype=np.int64).reshape(-1, 2)
+
+    def encode(pairs, keys, count):
+        keys = np.arange(count, dtype=np.int64) if keys is None else np.asarray(keys, dtype=np.int64)
+        if keys.shape != (count,) or len(np.unique(keys)) != count:
+            raise ValueError("交差比較用のFace対応が不正です。")
+        mapped = np.ascontiguousarray(np.sort(keys[pairs], axis=1))
+        return mapped.view(np.dtype([("a", np.int64), ("b", np.int64)])).reshape(-1)
+
+    current_keys = encode(pairs, face_keys, report["face_count"])
+    original_keys = encode(reference_pairs, reference_face_keys, reference["face_count"])
+    new_pairs = pairs[~np.isin(current_keys, original_keys)]
+    ignored_reference_count = len(pairs) - len(new_pairs)
+    ignored_uniform_count = 0
+    if uniform_groups is not None:
+        groups = np.asarray(uniform_groups, dtype=np.int64)
+        if groups.shape != (report["face_count"],) or np.any(groups < -1):
+            raise ValueError("交差比較用のパーツ変形区分が不正です。")
+        left, right = groups[new_pairs[:, 0]], groups[new_pairs[:, 1]]
+        unchanged_internal = (left >= 0) & (left == right)
+        ignored_uniform_count = int(np.count_nonzero(unchanged_internal))
+        new_pairs = new_pairs[~unchanged_internal]
+    return {**report, "comparison": "new_face_pairs", "pairs": new_pairs,
+            "face_ids": np.unique(new_pairs).tolist(), "pair_count": len(new_pairs),
+            "sample_pairs": new_pairs[:100].tolist(), "total_pair_count": report["pair_count"],
+            "reference_pair_count": reference["pair_count"], "ignored_pair_count": len(pairs) - len(new_pairs),
+            "ignored_reference_pair_count": ignored_reference_count, "ignored_uniform_pair_count": ignored_uniform_count}
 
 
 def assemble_parts(parts):

@@ -1,6 +1,6 @@
 // Coordinates remain in the input scene. Attachments are ordered parent first.
 export function transformedAnchor(part, scale, anchor, translation = [0, 0, 0]) {
-  return anchor.map((value, axis) => part.center[axis] + scale * (value - part.center[axis]) + translation[axis]);
+  return anchor.map((value, axis) => value + (scale - 1) * (value - part.center[axis]) + translation[axis]);
 }
 
 export function solveTranslations(parts, scales, attachments, offsets = {}) {
@@ -9,9 +9,10 @@ export function solveTranslations(parts, scales, attachments, offsets = {}) {
   for (const attachment of attachments) {
     const parent = byId.get(attachment.parent_id);
     const child = byId.get(attachment.child_id);
-    const parentAnchor = transformedAnchor(parent, scales[String(parent.part_id)], attachment.anchor, translations[String(parent.part_id)]);
-    const childAnchor = transformedAnchor(child, scales[String(child.part_id)], attachment.anchor);
-    translations[String(child.part_id)] = parentAnchor.map((value, axis) => value - childAnchor[axis]);
+    // Subtract anchor displacements so unit scales produce exact zero motion.
+    translations[String(child.part_id)] = attachment.anchor.map((value, axis) =>
+      (scales[String(parent.part_id)] - 1) * (value - parent.center[axis]) + translations[String(parent.part_id)][axis]
+      - (scales[String(child.part_id)] - 1) * (value - child.center[axis]));
   }
   // Add manual motion after solving every connection, so children do not follow it.
   return Object.fromEntries(parts.map(part => {
