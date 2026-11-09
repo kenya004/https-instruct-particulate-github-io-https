@@ -25,7 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "alive", "service": "ip-object-name"}
 
     @app.post("/identify-object")
-    def identify(file: UploadFile = File(...), up_dir: str | None = Form(None)):
+    def identify(file: UploadFile = File(...), up_dir: str | None = Form(None), auto_orient: bool | None = Form(None)):
         try:
             filename = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
             if Path(filename).suffix.lower() != ".glb":
@@ -34,6 +34,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 settings = app.state.settings
                 if up_dir is not None:
                     settings = replace(settings, up_dir=normalize_up_dir(up_dir))
+                if auto_orient is not None:
+                    settings = replace(settings, auto_orient=auto_orient)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             if file.size is not None and file.size > MAX_UPLOAD_BYTES:

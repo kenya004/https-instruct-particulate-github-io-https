@@ -15,7 +15,7 @@ import editing
 import connections
 
 # Upgrade the older client once without reloading its class on every rerun.
-if not hasattr(backend_client.BackendClient, "refine_boundary"):
+if not hasattr(backend_client.BackendClient, "refine_boundary") or getattr(backend_client, "AUTO_ORIENTATION_PROTOCOL", 0) < 1:
     importlib.reload(backend_client)
 if getattr(editing, "EDITING_PROTOCOL", 0) < 2:
     importlib.reload(editing)
@@ -24,6 +24,7 @@ if "boundary_edges" not in connections.Connection.__dataclass_fields__:
 refresh_ui_modules(names=("connections", "workflow", "orientation", "movement_axes", "boundary_blending", "rejoining", "mesh_overlaps", "viewer", "part_editor"))
 
 from backend_client import BackendClient, BackendError
+from orientation import aligned_mesh_payloads
 from part_editor import render_part_editor
 from viewer import load_mesh_payloads, load_segmented_payloads, mesh_figure, mesh_viewer_config
 from workflow import (
@@ -62,11 +63,12 @@ with left:
     st.subheader("入力")
     uploaded = st.file_uploader("GLBモデル", type=["glb"], key="model_file")
     up_dir = st.selectbox("モデルの上方向", ["+Z", "-Z", "+Y", "-Y", "+X", "-X"], key="up_dir")
-    st.caption("GLB内で物体の上に向かう軸を選びます。入力・分割・編集・結合の表示で、その方向を上へ向けます。")
+    auto_orient = st.toggle("名前推定と同時に上方向を自動調整", value=True, key="auto_orient")
+    st.caption("自動調整後は上を＋Zへ向け、最下点をZ＝0へ移動します。上方向の選択は推定用画像の初期設定で、推定できない場合もこの方向を使います。")
     request = st.text_area("編集要求", height=170, max_chars=4000, key="edit_request")
 
 content = uploaded.getvalue() if uploaded is not None else None
-current_identity = input_identity(uploaded.name, content, up_dir, base_url) if content is not None else None
+current_identity = input_identity(uploaded.name, content, up_dir, base_url, auto_orient) if content is not None else None
 view_key = hashlib.sha256(current_identity.encode()).hexdigest()[:16] if current_identity is not None else "empty"
 if content is None:
     state.clear()
@@ -95,7 +97,7 @@ with left:
                 client = BackendClient(base_url)
                 prepare_parts(
                     state, client, filename=uploaded.name, content=content,
-                    edit_request=request, up_dir=up_dir,
+                    edit_request=request, up_dir=up_dir, auto_orient=auto_orient,
                     progress=lambda label: status.update(label=label),
                 )
                 status.update(label="パーツ構成を作成しました", state="complete", expanded=False)
@@ -106,11 +108,25 @@ with left:
     st.write(state.get("object_name") or "未推定")
     if state.get("model_id"):
         st.caption(f"ID: {state['model_id']}")
+    pose = state.get("orientation")
+    if pose and pose.get("applied"):
+        st.caption("上方向を自動推定し、＋Z・Z＝0へ調整しました。" if pose.get("status") == "estimated"
+                   else "上方向を推定できなかったため、選択した方向を＋Zへ向け、Z＝0へ接地しました。")
+    elif state.get("auto_orientation_missing"):
+        st.warning("自動姿勢合わせが未適用です。WSL側のバックエンドを更新し、モデルを登録し直してください。")
+
+display_up_dir = "+Z" if (state.get("orientation") or {}).get("applied") else up_dir
+pose_key = hashlib.sha256(json.dumps(state.get("orientation"), sort_keys=True).encode()).hexdigest()[:12]
+view_key += ":" + pose_key
 
 with right:
     st.subheader("入力モデル")
     if meshes:
-        st.plotly_chart(mesh_figure(meshes, up_dir=up_dir), width="stretch", key=f"input_view_{view_key}", config=mesh_viewer_config())
+        try:
+            preview = aligned_mesh_payloads(meshes, state.get("orientation"))
+            st.plotly_chart(mesh_figure(preview, up_dir=display_up_dir), width="stretch", key=f"input_view_{view_key}", config=mesh_viewer_config())
+        except ValueError as error:
+            st.error(str(error))
     else:
         with st.container(height=430, border=False):
             st.caption("未選択")
@@ -269,7 +285,7 @@ if plan:
                     if visible:
                         vertices = np.concatenate([np.asarray(mesh["vertices"]) for mesh in split_meshes])
                         bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)])
-                        st.plotly_chart(mesh_figure(visible, up_dir=up_dir, bounds=bounds), width="stretch", key=f"segmentation_view_{view_key}", config=mesh_viewer_config())
+                        st.plotly_chart(mesh_figure(visible, up_dir=display_up_dir, bounds=bounds), width="stretch", key=f"segmentation_view_{view_key}", config=mesh_viewer_config())
                     else:
                         st.warning("このパーツに割り当てられた面はありません。")
                 except Exception as error:
@@ -281,7 +297,7 @@ if plan:
             st.subheader("パーツ編集")
             st.caption("各パーツの倍率と3方向の移動量を編集します。倍率1.00・移動量0が元の形状です。")
             try:
-                render_part_editor(result, artifacts["parts.npz"], up_dir)
+                render_part_editor(result, artifacts["parts.npz"], display_up_dir)
                 editor_present = True
             except Exception as error:
                 st.error(f"編集データを読み込めません：{error}")

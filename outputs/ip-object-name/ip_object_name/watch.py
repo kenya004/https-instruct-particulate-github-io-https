@@ -58,7 +58,7 @@ class FolderWatcher:
                     self.waiting = True
                     continue
                 metadata = self.store.register(
-                    path, up_dir=self.settings.up_dir, expected_signature=signature
+                    path, up_dir=self.settings.up_dir, expected_signature=signature, auto_orient=self.settings.auto_orient
                 )
             except (FileNotFoundError, SourceChangedError):
                 self._observed.pop(path, None)
@@ -84,6 +84,7 @@ def main() -> int:
     parser.add_argument("--models-dir", type=Path)
     parser.add_argument("--model")
     parser.add_argument("--up-dir", type=core.normalize_up_dir)
+    parser.add_argument("--auto-orient", action="store_true", help="Estimate up direction with the name, then rotate and ground new models.")
     parser.add_argument("--blender-bin")
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument("--settle-seconds", type=float, default=2.0)
@@ -95,6 +96,8 @@ def main() -> int:
     try:
         settings = core.Settings.from_env()
         overrides = {name: getattr(args, name) for name in ("model", "up_dir", "blender_bin") if getattr(args, name) is not None}
+        if args.auto_orient:
+            overrides["auto_orient"] = True
         if args.repo is not None:
             overrides["repo_root"] = args.repo.expanduser().resolve()
         settings = replace(settings, **overrides)

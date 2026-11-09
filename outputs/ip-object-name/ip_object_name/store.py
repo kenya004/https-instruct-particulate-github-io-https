@@ -80,7 +80,7 @@ class ModelStore:
         model_id = self._sources.get((str(path.resolve()), *signature))
         return self.get(model_id) if model_id else None
 
-    def register(self, path: Path, *, up_dir: str, expected_signature: tuple[int, int] | None = None) -> dict[str, Any]:
+    def register(self, path: Path, *, up_dir: str, expected_signature: tuple[int, int] | None = None, auto_orient: bool = False) -> dict[str, Any]:
         path = path.expanduser().resolve()
         direction = core.normalize_up_dir(up_dir)
         if path.suffix.lower() != ".glb":
@@ -108,6 +108,8 @@ class ModelStore:
                 "source_mtime_ns": before[1],
                 "source_sha256": digest,
                 "input_mesh": str(target / "input.glb"),
+                "original_input_mesh": str(target / "input.glb"), "input_sha256": digest,
+                "source_up_dir": direction, "auto_orient": bool(auto_orient), "orientation": None,
                 "up_dir": direction,
                 "units": None,
                 "created_at": utc_now(),
@@ -145,7 +147,8 @@ class ModelStore:
         run_id = uuid4().hex
         run_dir = folder / "recognition" / run_id
         run_dir.mkdir(parents=True)
-        settings = replace(settings, up_dir=metadata["up_dir"])
+        settings = replace(settings, up_dir=metadata.get("source_up_dir", metadata["up_dir"]))
+        auto_orient = metadata.get("auto_orient", settings.auto_orient)
         metadata.update(
             status="processing", started_at=utc_now(), finished_at=None,
             error=None, recognition_run_id=run_id, vlm_model=settings.model,
@@ -157,14 +160,14 @@ class ModelStore:
             environment = core.check_environment(settings)
             renderer, data_utils = core._upstream(settings.repo_root)
             mesh = data_utils.load_trimesh(input_path)
-            prompt = Path(core.__file__).with_name("object-name-system-prompt.md").read_text(encoding="utf-8")
+            prompt = core.recognition_prompt(auto_orient).read_text(encoding="utf-8")
             (run_dir / "system_prompt.md").write_text(prompt, encoding="utf-8")
             config = {
                 "model_id": model_id,
                 "run_id": run_id,
                 "vlm_model": settings.model,
                 "google_genai_version": version("google-genai"),
-                "up_dir": metadata["up_dir"],
+                "up_dir": settings.up_dir, "auto_orient": auto_orient,
                 "system_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
                 "generation_parameters": "API defaults; only JSON response format and schema are specified.",
                 "azimuths_deg": list(renderer.DEFAULT_AUTO_KINEMATICS_AZIMUTHS),
@@ -179,17 +182,29 @@ class ModelStore:
                 output_dir=run_dir / "renders",
                 azimuths_deg=renderer.DEFAULT_AUTO_KINEMATICS_AZIMUTHS,
                 mesh_path=input_path,
-                up_dir=metadata["up_dir"],
+                up_dir=settings.up_dir,
                 blender_bin=environment["blender_bin"],
             )
             if not views or any(not Path(view.image_path).is_file() for view in views):
                 raise RuntimeError("The renderer did not produce the expected images.")
-            name = core.validate_prediction({"object_name": core.request_object_name(views, model=settings.model)})
+            orientation = None
+            processing_path = input_path
+            if auto_orient:
+                from .pose import align_glb
+                prediction = core.request_object_analysis(views, model=settings.model)
+                name = prediction["object_name"]
+                processing_path = folder / "oriented.glb"
+                orientation = align_glb(input_path, processing_path, render_up_dir=settings.up_dir, up_vector=prediction["up_vector"])
+            else:
+                name = core.validate_prediction({"object_name": core.request_object_name(views, model=settings.model)})
+            processing_sha = orientation["processing_sha256"] if orientation else metadata["source_sha256"]
             result = {
                 **config, "object_name": name, "status": "identified",
                 "source_filename": metadata["source_filename"],
                 "source_sha256": metadata["source_sha256"],
-                "input_mesh": metadata["input_mesh"],
+                "input_mesh": str(processing_path), "original_input_mesh": str(input_path),
+                "input_sha256": processing_sha, "orientation": orientation,
+                "up_dir": "+Z" if orientation else settings.up_dir, "source_up_dir": settings.up_dir,
                 "created_at": utc_now(),
                 "render_images": [str(view.image_path) for view in views],
             }
@@ -198,6 +213,8 @@ class ModelStore:
             metadata.update(
                 status="completed", object_name=name, finished_at=utc_now(),
                 recognition_result=str(run_dir / "object_name.json"),
+                input_mesh=str(processing_path), original_input_mesh=str(input_path), input_sha256=processing_sha,
+                orientation=orientation, up_dir="+Z" if orientation else settings.up_dir,
             )
         except Exception as error:
             metadata.update(status="failed", finished_at=utc_now(), error=error_details(error))

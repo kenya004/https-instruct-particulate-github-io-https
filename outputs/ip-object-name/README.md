@@ -1,9 +1,11 @@
 # GLBからオブジェクト名を取得する
 
-Instruct-Particulateの画像生成処理を利用し、Geminiから物体全体の名前だけを取得します。
-パーツ分割・関節推定・形状編集・SegmentDesign3DのUIへの接続は、今回の実装には含めていません。
+Instruct-Particulateの画像生成処理を利用し、Geminiから物体全体の名前を取得します。
+ここでは名前推定の基本CLI/APIを説明します。UI・パーツリスト・分割との連携は[準備API](PREPARATION_API.md)を参照してください。
 
 処理は `GLB → Blenderで4方向のPNGを生成 → Gemini → object_name.json` です。
+`--auto-orient` を指定すると、同じVLM呼び出しで上方向も推定し、回転・接地後の処理用GLBを出力します。
+Windows UIはこの機能が初期状態でオンです。[配置・使用手順](AUTO_ORIENTATION.md)を参照してください。
 `app.py`や`InstructParticulateApp`は読み込まず、分割用のモデル重みも読み込みません。
 VLMの推論は外部APIで行います。画像生成には既存のBlenderスクリプトを使い、そのCycles/GPU設定を引き継ぎます。
 

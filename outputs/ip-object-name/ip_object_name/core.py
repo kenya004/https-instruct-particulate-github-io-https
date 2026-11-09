@@ -46,6 +46,7 @@ class Settings:
     model: str = DEFAULT_MODEL
     up_dir: str = "+Z"
     blender_bin: str | None = None
+    auto_orient: bool = False
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -57,6 +58,7 @@ class Settings:
             model=os.getenv("IP_OBJECT_NAME_MODEL", DEFAULT_MODEL),
             up_dir=normalize_up_dir(os.getenv("IP_OBJECT_NAME_UP_DIR", "+Z")),
             blender_bin=os.getenv("BLENDER_BIN") or None,
+            auto_orient=os.getenv("IP_OBJECT_NAME_AUTO_ORIENT", "false").strip().lower() in {"1", "true", "yes"},
         )
 
 
@@ -104,6 +106,7 @@ def check_environment(settings: Settings, *, require_key: bool = True) -> dict[s
         "blender_bin": str(blender),
         "vlm_model": settings.model,
         "up_dir": normalize_up_dir(settings.up_dir),
+        "auto_orient": settings.auto_orient,
         "api_key_configured": bool(_api_key(required=False)),
         "note": "Local configuration checked; Blender execution and VLM access are not tested here.",
     }
@@ -132,14 +135,31 @@ def validate_prediction(payload: Any) -> str:
     return name
 
 
-def request_object_name(views: list, *, model: str) -> str:
+def recognition_prompt(auto_orient: bool) -> Path:
+    return Path(__file__).with_name("object-pose-system-prompt.md" if auto_orient else "object-name-system-prompt.md")
+
+
+def _request_prediction(views: list, *, model: str, auto_orient: bool = False) -> dict:
     from google import genai
     from google.genai import types
 
-    prompt_path = Path(__file__).with_name("object-name-system-prompt.md")
+    prompt_path = recognition_prompt(auto_orient)
+    schema = {"type": "OBJECT", "properties": {"object_name": {"type": "STRING"}}, "required": ["object_name"]}
+    if auto_orient:
+        schema["properties"]["up_vector"] = {"type": "ARRAY", "items": {"type": "NUMBER"},
+                                               "minItems": 3, "maxItems": 3, "nullable": True}
+        schema["required"].append("up_vector")
     parts = [types.Part.from_text(text="Identify the single object shown in these views of the same 3D mesh.")]
     for index, view in enumerate(views):
         parts.append(types.Part.from_text(text=f"View {index + 1} of the same object:"))
+        if auto_orient:
+            import numpy as np
+            matrix = np.asarray(getattr(view, "camera_to_world", None), dtype=float)
+            if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+                raise SetupError("The renderer must provide camera_to_world for automatic orientation. Update the upstream renderer.")
+            basis = {label: matrix[:3, axis].round(7).tolist()
+                     for label, axis in (("image_right", 0), ("image_up", 1), ("toward_camera", 2))}
+            parts.append(types.Part.from_text(text="Camera basis in shared render-world XYZ: " + json.dumps(basis)))
         parts.append(types.Part.from_bytes(data=Path(view.image_path).read_bytes(), mime_type="image/png"))
     try:
         with genai.Client(api_key=_api_key(), http_options=types.HttpOptions(timeout=120_000)) as client:
@@ -149,11 +169,7 @@ def request_object_name(views: list, *, model: str) -> str:
                 config=types.GenerateContentConfig(
                     system_instruction=prompt_path.read_text(encoding="utf-8"),
                     response_mime_type="application/json",
-                    response_schema={
-                        "type": "OBJECT",
-                        "properties": {"object_name": {"type": "STRING"}},
-                        "required": ["object_name"],
-                    },
+                    response_schema=schema,
                 ),
             )
     except SetupError:
@@ -164,7 +180,24 @@ def request_object_name(views: list, *, model: str) -> str:
         payload = json.loads(response.text)
     except (TypeError, ValueError) as exc:
         raise VLMError("VLM did not return valid JSON.") from exc
-    return validate_prediction(payload)
+    return payload
+
+
+def request_object_name(views: list, *, model: str) -> str:
+    return validate_prediction(_request_prediction(views, model=model))
+
+
+def request_object_analysis(views: list, *, model: str) -> dict:
+    from .pose import unit_direction
+    payload = _request_prediction(views, model=model, auto_orient=True)
+    name = validate_prediction(payload)
+    if "up_vector" not in payload:
+        raise VLMError("VLM response must contain up_vector (or null if unknown).")
+    try:
+        up = unit_direction(payload["up_vector"])
+    except (TypeError, ValueError) as error:
+        raise VLMError(str(error)) from error
+    return {"object_name": name, "up_vector": None if up is None else up.tolist()}
 
 
 def identify_object(
@@ -183,7 +216,7 @@ def identify_object(
     except Exception as exc:
         raise InvalidMeshError("Could not read nonempty triangle mesh geometry from this GLB.") from exc
 
-    # Keep the original GLB and its render orientation for the later segmentation step.
+    # Retain raw input separately from the optional aligned processing copy.
     model_id = uuid4().hex
     output_dir = settings.output_root.expanduser().resolve() / model_id
     output_dir.mkdir(parents=True)
@@ -201,18 +234,32 @@ def identify_object(
     )
     if not views or any(not Path(view.image_path).is_file() for view in views):
         raise RuntimeError("The renderer did not produce the expected images.")
-    name = None if render_only else request_object_name(views, model=settings.model)
+    orientation = None
+    name = None
+    processing_path = input_path
+    if not render_only:
+        if settings.auto_orient:
+            from .pose import align_glb
+            prediction = request_object_analysis(views, model=settings.model)
+            name = prediction["object_name"]
+            processing_path = output_dir / "oriented.glb"
+            orientation = align_glb(input_path, processing_path, render_up_dir=environment["up_dir"], up_vector=prediction["up_vector"])
+        else:
+            name = request_object_name(views, model=settings.model)
     result = {
         "model_id": model_id,
         "object_name": name,
         "status": "rendered" if render_only else "identified",
         "source_filename": source_filename or mesh_path.name,
         "source_sha256": digest,
-        "up_dir": environment["up_dir"],
+        "up_dir": "+Z" if orientation else environment["up_dir"],
+        "source_up_dir": environment["up_dir"], "auto_orient": settings.auto_orient,
+        "orientation": orientation, "original_input_mesh": str(input_path),
+        "input_sha256": orientation["processing_sha256"] if orientation else digest,
         "vlm_model": None if render_only else settings.model,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "output_dir": str(output_dir),
-        "input_mesh": str(input_path),
+        "input_mesh": str(processing_path),
         "render_images": [str(view.image_path) for view in views],
     }
     (output_dir / "object_name.json").write_text(

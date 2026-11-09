@@ -21,12 +21,15 @@ def main() -> int:
     parser.add_argument("--blender-bin")
     parser.add_argument("--check", action="store_true", help="Check local configuration without rendering or calling the VLM.")
     parser.add_argument("--render-only", action="store_true", help="Generate images without an API key or VLM request.")
+    parser.add_argument("--auto-orient", action="store_true", help="Estimate name and up direction together, then rotate and ground the processing GLB.")
     args = parser.parse_args()
     if not args.check and args.mesh is None:
         parser.error("--mesh is required unless --check is used.")
     try:
         settings = Settings.from_env()
         overrides = {}
+        if args.auto_orient:
+            overrides["auto_orient"] = True
         for name in ("model", "up_dir", "blender_bin"):
             if getattr(args, name) is not None:
                 overrides[name] = getattr(args, name)

@@ -208,7 +208,7 @@ def segment_registered_model(store: ModelStore, model_id: str, plan_id: str, run
     metadata, plan, folder = load_plan(store, model_id, plan_id)
     source = Path(metadata["input_mesh"])
     with source.open("rb") as stream:
-        if hashlib.file_digest(stream, "sha256").hexdigest() != metadata["source_sha256"]:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != metadata.get("input_sha256", metadata["source_sha256"]):
             raise ValueError("The registered input GLB has changed. Register it again.")
     segmentation_id = uuid4().hex
     run_dir = folder / "segmentations" / segmentation_id
@@ -217,6 +217,7 @@ def segment_registered_model(store: ModelStore, model_id: str, plan_id: str, run
         "model_id": model_id, "plan_id": plan_id, "segmentation_id": segmentation_id,
         "up_dir": metadata["up_dir"], "part_names": [part["name"] for part in plan["parts"]],
         "source_sha256": metadata["source_sha256"], "options": asdict(options), "created_at": utc_now(),
+        "input_sha256": metadata.get("input_sha256", metadata["source_sha256"]), "orientation": metadata.get("orientation"),
     })
     try:
         partition = runner(source, [part["name"] for part in plan["parts"]], metadata["up_dir"], options)
@@ -227,6 +228,8 @@ def segment_registered_model(store: ModelStore, model_id: str, plan_id: str, run
                     f"{plan['parts'][item['part_id']]['name']}: Edge共有でつながらない領域が{item['components_after']}個残っています。"
                     "同位置の重複頂点は考慮済みです。独立領域や座標が一致しない継ぎ目を確認してください。")
         manifest["options"] = asdict(options)
+        manifest["up_dir"] = metadata["up_dir"]
+        manifest["orientation"] = metadata.get("orientation")
         base = f"/models/{model_id}/plans/{plan_id}/segmentations/{segmentation_id}/files"
         manifest["files"] = {name: f"{base}/{name}" for name in ARTIFACTS}
         write_json(run_dir / "parts.json", manifest)

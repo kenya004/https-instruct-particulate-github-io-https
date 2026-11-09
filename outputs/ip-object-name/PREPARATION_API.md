@@ -5,6 +5,9 @@ VLMによる名前推定と、その名前・編集要求を入力するテキ�
 両方にGeminiを利用しますが、LLMのパーツリスト作成に画像やGLBは渡しません。
 APIキーは既存の`ip_object_name/local_settings.py`を使用します。
 
+名前推定と同時に上方向を推定し、回転・接地する処理を追加しました。
+Windows UIで使用する前に、[自動姿勢合わせの更新手順](AUTO_ORIENTATION.md)でWSL側を更新してください。
+
 ## WSLへ配置する
 
 起動中のフォルダ監視を`Ctrl+C`で停止してください。
@@ -26,7 +29,8 @@ cp "$bundle/requirements-object-name.txt" .
 pip install -r requirements-object-name.txt
 ```
 
-`core.py`、`credentials.py`、`local_settings.py`、既存の入力モデルは上書きしません。
+上記はパーツリストAPIの基本配置です。自動姿勢合わせには前述の追加更新が必要です。
+`credentials.py`、`local_settings.py`、既存の入力モデルは上書きしません。
 
 ## 起動
 

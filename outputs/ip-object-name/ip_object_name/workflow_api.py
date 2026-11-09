@@ -42,7 +42,7 @@ class BoundaryRequest(BaseModel):
 def create_app(settings: core.Settings | None = None, *, models_root: Path | None = None, planner_model: str | None = None, segmentation_runner=None) -> FastAPI:
     import os
 
-    app = FastAPI(title="Instruct-Particulate Preparation API", version="0.3.0")
+    app = FastAPI(title="Instruct-Particulate Preparation API", version="0.4.0")
     app.state.settings = settings or core.Settings.from_env()
     root = (models_root or app.state.settings.repo_root / "data" / "models").expanduser().resolve()
     app.state.models_root = root
@@ -68,10 +68,11 @@ def create_app(settings: core.Settings | None = None, *, models_root: Path | Non
 
     @app.get("/health")
     def health():
-        return {"status": "alive", "service": "ip-preparation", "recognition_model": app.state.settings.model, "planner_model": app.state.planner_model}
+        return {"status": "alive", "service": "ip-preparation", "recognition_model": app.state.settings.model, "planner_model": app.state.planner_model,
+                "features": {"auto_orientation": True}}
 
     @app.post("/models", status_code=201)
-    def register(file: UploadFile = File(...), edit_request: str = Form(...), up_dir: str = Form("+Z")):
+    def register(file: UploadFile = File(...), edit_request: str = Form(...), up_dir: str = Form("+Z"), auto_orient: bool = Form(False)):
         try:
             try:
                 request = normalize_edit_request(edit_request)
@@ -96,7 +97,7 @@ def create_app(settings: core.Settings | None = None, *, models_root: Path | Non
                     core.validate_glb(source)
                 except core.InvalidMeshError as error:
                     raise HTTPException(422, str(error)) from None
-                metadata = store.register(source, up_dir=direction)
+                metadata = store.register(source, up_dir=direction, auto_orient=auto_orient)
                 metadata["source_kind"] = "ui_upload"
                 store.save(metadata)
                 write_json(Path(metadata["input_mesh"]).parent / "edit_request.json", {"edit_request": request, "created_at": utc_now()})

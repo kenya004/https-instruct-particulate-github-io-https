@@ -18,19 +18,19 @@ def clear_refinements(state: dict):
         state.pop(key, None)
 
 
-def input_identity(filename: str, content: bytes, up_dir: str, base_url: str) -> str:
+def input_identity(filename: str, content: bytes, up_dir: str, base_url: str, auto_orient: bool = True) -> str:
     digest = hashlib.sha256(content).hexdigest()
-    return repr((filename, digest, up_dir, base_url.strip().rstrip("/")))
+    return repr((filename, digest, up_dir, base_url.strip().rstrip("/"), auto_orient))
 
 
 def prepare_parts(
     state: dict, client: BackendClient, *, filename: str, content: bytes,
-    edit_request: str, up_dir: str, progress: Callable[[str], None],
+    edit_request: str, up_dir: str, progress: Callable[[str], None], auto_orient: bool = True,
 ) -> dict:
     request = edit_request.strip()
     if not request:
         raise ValueError("編集要求を入力してください。")
-    identity = input_identity(filename, content, up_dir, client.base_url)
+    identity = input_identity(filename, content, up_dir, client.base_url, auto_orient)
     if state.get("input_identity") != identity:
         state.clear()
         state["input_identity"] = identity
@@ -39,12 +39,15 @@ def prepare_parts(
     clear_refinements(state)
     if not state.get("model_id"):
         progress("モデルを保存しています")
-        model = client.register(filename, content, request, up_dir)
+        model = client.register(filename, content, request, up_dir, auto_orient=auto_orient)
         state["model_id"] = model["model_id"]
     if not state.get("object_name"):
-        progress("オブジェクト名を推定しています")
+        progress("名前と上方向を推定しています" if auto_orient else "オブジェクト名を推定しています")
         model = client.recognize(state["model_id"])
         state["object_name"] = model["object_name"]
+        state["orientation"] = model.get("orientation")
+        state["model_up_dir"] = model.get("up_dir", up_dir)
+        state["auto_orientation_missing"] = bool(auto_orient and not state["orientation"])
     progress("パーツ構成を作成しています")
     plan = client.plan(state["model_id"], request)
     state["plan"] = plan

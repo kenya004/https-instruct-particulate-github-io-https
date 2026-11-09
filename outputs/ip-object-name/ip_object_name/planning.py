@@ -133,6 +133,8 @@ def plan_registered_model(store: ModelStore, model_id: str, edit_request: str, *
             "parts": [{"part_id": index, **part.model_dump()} for index, part in enumerate(prediction.parts)],
             "part_names": [part.name for part in prediction.parts],
             "input_mesh": metadata["input_mesh"], "source_sha256": metadata["source_sha256"],
+            "input_sha256": metadata.get("input_sha256", metadata["source_sha256"]),
+            "up_dir": metadata["up_dir"], "orientation": metadata.get("orientation"),
         }
         write_json(run_dir / "part_plan.json", result)
         write_json(folder / "planning" / "part_plan.json", result)

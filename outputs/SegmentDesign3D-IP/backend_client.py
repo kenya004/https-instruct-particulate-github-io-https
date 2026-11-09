@@ -5,6 +5,8 @@ from urllib.parse import urlsplit
 
 import requests
 
+AUTO_ORIENTATION_PROTOCOL = 1
+
 
 class BackendError(RuntimeError):
     pass
@@ -34,10 +36,10 @@ class BackendClient:
             raise BackendError("推論サーバーの応答形式を確認してください。")
         return data
 
-    def register(self, filename: str, content: bytes, edit_request: str, up_dir: str) -> dict:
+    def register(self, filename: str, content: bytes, edit_request: str, up_dir: str, auto_orient: bool = True) -> dict:
         return self._request(
             "POST", "/models", files={"file": (filename, content, "model/gltf-binary")},
-            data={"edit_request": edit_request, "up_dir": up_dir},
+            data={"edit_request": edit_request, "up_dir": up_dir, "auto_orient": str(auto_orient).lower()},
         )
 
     def recognize(self, model_id: str) -> dict:
