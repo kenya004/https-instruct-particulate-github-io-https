@@ -31,6 +31,8 @@
     .translation-heading {display:flex; justify-content:space-between; gap:8px; font-size:12px;}
     .translation-heading label {color:var(--axis-color); font-weight:550;}
     .translation input[type=range] {margin:3px 0 0; height:20px; accent-color:var(--axis-color);}
+    .translation input.zero-snap {accent-color:#13776c;}
+    #zero-snap-hint {font-size:11px; line-height:1.5; color:#68767a; margin:0 0 8px;}
     #viewport {height:500px; min-width:0; width:100%; position:relative; overflow:hidden; background:#f8fafb;}
     canvas {display:block; width:100%; height:100%; touch-action:none;}
     #error {padding:12px; color:#a52f3c; overflow-wrap:anywhere;}
@@ -52,6 +54,7 @@
         <button id="fit" title="全体を表示" aria-label="全体を表示"><i data-lucide="focus"></i></button>
       </div>
       <p id="compatibility" role="status" hidden></p>
+      <p id="zero-snap-hint">移動は0付近で吸着します。矢印キーで微調整できます。</p>
       <div id="sliders"></div>
     </section>
     <section class="view" aria-label="編集モデル">
@@ -60,6 +63,6 @@
       <div id="error" role="alert" hidden></div>
     </section>
   </main>
-  <script type="module" src="./editor.js?v=8c6f3716ad57"></script>
+  <script type="module" src="./editor.js?v=406a40f4ca3f"></script>
 </body>
 </html>

@@ -8,6 +8,7 @@ import { affineTransforms, sampledAnchor, writeBlendedPositions } from "./bounda
 import { applyDisplayOrientation, CAMERA_EYE, DISPLAY_UP, sourceToDisplay } from "./orientation.js";
 import { localOffset, setLocalOffset } from "./translation_frames.js";
 import { highlightPositions } from "./overlap_highlights.js";
+import { bindZeroDetent } from "./zero_detent.js";
 
 const viewport = document.getElementById("viewport");
 const sliderList = document.getElementById("sliders");
@@ -233,6 +234,8 @@ function updateScale(partId, value, redraw = true) {
 }
 
 function formatOffset(value) {
+  // Oblique-frame projections can leave roundoff far below one slider step.
+  if (Math.abs(value) < movement.step * 1e-7) return "0";
   return `${value > 0 ? "+" : ""}${Number(value.toPrecision(6))}`;
 }
 
@@ -393,7 +396,7 @@ function rebuild(args) {
     motionLabel.textContent = boundaryMotion.parts[id]
       ? `断面固定移動（遷移 ${Math.round(boundaryMotion.parts[id].ratio * 100)}%）` : "全体移動";
     row.appendChild(motionLabel);
-    const moveInputs = [], moveOutputs = [];
+    const moveInputs = [], moveOutputs = [], moveDetents = [];
     for (const [axis, name] of ["X", "Y", "Z"].entries()) {
       const labelName = movementFrames[id].labels[axis];
       const control = document.createElement("div");
@@ -414,8 +417,8 @@ function rebuild(args) {
       moveInput.step = String(movement.step);
       moveInput.disabled = empty;
       moveInput.setAttribute("aria-label", `${part.name} ${labelName}移動`);
-      moveInput.addEventListener("pointerdown", () => { dragging = true; });
-      moveInput.addEventListener("input", () => updateOffset(id, axis, Number(moveInput.value)));
+      moveInput.title = "0付近で吸着します。矢印キーで細かく調整できます。";
+      moveDetents.push(bindZeroDetent(moveInput, value => updateOffset(id, axis, value), () => { dragging = true; }));
       moveInput.addEventListener("change", commit);
       moveHeading.append(moveLabel, moveOutput);
       control.append(moveHeading, moveInput);
@@ -424,7 +427,7 @@ function rebuild(args) {
       moveOutputs.push(moveOutput);
     }
     sliderList.appendChild(row);
-    widgets.set(id, { input, output, empty, moveInputs, moveOutputs });
+    widgets.set(id, { input, output, empty, moveInputs, moveOutputs, moveDetents });
     if (!empty && renderer) {
       const center = new THREE.Vector3(...part.center);
       const positions = new Float32Array(part.vertices.length * 3);
@@ -514,8 +517,12 @@ document.getElementById("reset").addEventListener("click", () => {
   commit();
 });
 document.getElementById("fit").addEventListener("click", fitView);
-window.addEventListener("pointerup", () => { dragging = false; });
-window.addEventListener("pointercancel", () => { dragging = false; });
+function endPointerDrag() {
+  dragging = false;
+  for (const widget of widgets.values()) for (const detent of widget.moveDetents) detent.end();
+}
+window.addEventListener("pointerup", endPointerDrag);
+window.addEventListener("pointercancel", endPointerDrag);
 new ResizeObserver(resize).observe(document.getElementById("workspace"));
 
 Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
