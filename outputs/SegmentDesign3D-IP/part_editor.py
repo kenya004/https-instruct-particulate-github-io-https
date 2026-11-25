@@ -14,6 +14,7 @@ from movement_axes import build_movement_frames
 from mesh_overlaps import METHOD as OVERLAP_METHOD, assemble_parts, find_face_overlaps, only_new_overlaps, overlap_frame, part_face_ids
 from rejoining import export_rejoined_glb, export_rejoined_npz, has_rejoin_data, rejoin_input_key, rejoin_parts, rejoined_payload
 from viewer import mesh_figure, mesh_viewer_config
+from capping_panel import render_capping
 
 
 _component_directory = Path(__file__).with_name("scale_component") / "dist"
@@ -220,6 +221,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         file_name=f"{result['segmentation_id']}_scaled.glb", mime="model/gltf-binary", icon=":material/download:", key="download_edited_glb",
     )
     revision = rejoin_input_key(source_key, state["scales"], metadata)
+    render_capping(state, content, result, parts, edited, revision, metadata, up_dir, can_rejoin)
     if state.get("rejoined", {}).get("input_key") != revision:
         state.pop("rejoined", None)
     if st.button("一つのMeshへ結合", disabled=not can_rejoin, key="rejoin_mesh", icon=":material/join:"):
