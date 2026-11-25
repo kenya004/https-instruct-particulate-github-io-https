@@ -1,7 +1,7 @@
 """Caps for segmentation cuts, derived from the current independent parts.
 
 Original surface coordinates and provenance are retained. Planar projection is
-used only to choose triangles, never to flatten the actual boundary vertices.
+used for triangulation and diagnostics, never to flatten boundary vertices.
 """
 from __future__ import annotations
 
@@ -21,9 +21,10 @@ from movement_axes import boundary_plane
 from rejoining import _edge_groups
 
 
-METHOD = "segmentation_cut_caps_v4"
+METHOD = "segmentation_cut_caps_v5"
 MAX_PLANARITY = .02  # maximum point-to-plane distance / boundary bounding diagonal
-TRIANGULATIONS = {"point_only": "内点判定のみ（試行）", "earcut": "Earcut（従来）"}
+TRIANGULATIONS = {"point_only": "内点判定のみ（試行）", "earcut": "Earcut（従来）",
+                  "center_fan": "中心から放射状に生成"}
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,10 @@ class CappedPart:
     @property
     def is_cap(self):
         return self.cap_ids >= 0
+
+    @property
+    def is_cap_center(self):
+        return self.source_vertex_indices < 0
 
 
 @dataclass(frozen=True)
@@ -239,6 +244,29 @@ def _triangulate_point_only(vertices, rings, frame):
         "candidate_sample": sample, "candidate_sample_truncated": tested > len(sample)}
 
 
+def _triangulate_center_fan(vertices, rings, frame, center_index, polygon_type, union_all):
+    """Keep a complete fan for comparison, including concave-footprint problems."""
+    if len(rings) != 1:
+        raise _InvalidCut("中心からの放射状生成は穴のない単一輪郭が対象です。中空断面はEarcut（従来）を選んでください。")
+    loop = np.asarray(rings[0], dtype=np.int64)
+    center = frame["center"].copy()
+    # Reverse every existing boundary edge, sharing one new vertex per cut.
+    triangles = np.column_stack([np.full(len(loop), center_index, dtype=np.int64), np.roll(loop, -1), loop])
+    xy = _project(vertices, loop, frame)
+    polygon = polygon_type(xy)
+    patches = [polygon_type([np.zeros(2), a, b]) for a, b in zip(xy, np.roll(xy, -1, axis=0))]
+    covered = union_all([patch for patch in patches if patch.area > 0])
+    outside = float(covered.difference(polygon).area)
+    uncovered = float(polygon.difference(covered).area)
+    overlap = max(0.0, float(sum(patch.area for patch in patches) - covered.area))
+    tolerance = max(polygon.area, 1e-12) * 1e-8
+    return triangles, center, {"method": "boundary_center_fan_v1", "center_vertex": center_index,
+        "center": center.tolist(), "center_method": "edge_length_weighted_boundary_midpoints",
+        "start_independent": True, "projected_coverage_valid": max(outside, uncovered, overlap) <= tolerance,
+        "projected_outside_area": outside, "projected_uncovered_area": uncovered,
+        "projected_overlap_area": overlap, "projected_area_tolerance": tolerance}
+
+
 def _cap_regions(vertices, loops, limit, polygon_type, *, allow_nonplanar=False):
     """Group nested, nearly coplanar rings; disjoint cuts remain independent."""
     valid, skipped, failed, diagnostics = [], [], [], []
@@ -439,6 +467,8 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
         if set(offsets) - set(known):
             raise ValueError("開始頂点の対象断面が元のモデルにありません。")
         offsets = {key: value % known[key]["vertex_count"] for key, value in offsets.items() if value % known[key]["vertex_count"]}
+    if triangulation == "center_fan":
+        offsets = {}  # The complete fan is independent of boundary traversal start.
     current = {part.part_id: part for part in edited}
     if set(current) != {part.part_id for part in original} or len(current) != len(edited):
         raise ValueError("断面閉鎖の対象パーツが一致しません。")
@@ -467,32 +497,41 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
                           "vertex_count": len(loop), "first_candidate": shifted[:3].tolist()}
             starts_by_key[loop_key] = start_info
             info.update(start_info)
-        added, cap_ids, closed = [], [], []
+        added, cap_ids, closed, centers = [], [], [], []
         for rings, frame in regions:
             section_starts = [starts_by_key[_loop_key(part.part_id, local_sources[part.part_id][ring])] for ring in rings]
             shifted_rings = [np.roll(ring, -info["start_offset"]) for ring, info in zip(rings, section_starts)]
             try:
                 if triangulation == "point_only":
                     triangles, triangle_info = _triangulate_point_only(part.vertices, shifted_rings, frame)
+                elif triangulation == "center_fan":
+                    triangles, center, triangle_info = _triangulate_center_fan(
+                        part.vertices, rings, frame, len(part.vertices) + len(centers), Polygon, union_all)
                 else:
                     triangles = _triangulate(part.vertices, shifted_rings, frame, earcut, Polygon, union_all)
                     triangle_info = {"method": "earcut"}
             except (ValueError, RuntimeError) as error:
                 skipped.append({"reason": str(error), "boundary_edges": sum(map(len, rings)), "start_vertices": section_starts})
                 continue
+            if triangulation == "center_fan":
+                centers.append(center)
             added.extend(triangles.tolist())
             cap_ids.extend([next_cap] * len(triangles))
             closed.append({"cap_id": next_cap, "loops": len(rings), "holes": len(rings) - 1,
                            "boundary_edges": sum(map(len, rings)), "added_faces": len(triangles),
+                           "added_vertices": int(triangulation == "center_fan"),
                            "planarity": frame["planarity"], "nonplanar": frame["planarity"] > max_planarity,
                            "triangulation": triangle_info, "start_vertices": section_starts})
             next_cap += 1
         faces = np.vstack([base, np.asarray(added, dtype=np.int64).reshape(-1, 3)])
-        updated = replace(part, vertices=part.vertices.copy(), faces=faces)
+        vertices = np.vstack([part.vertices, np.asarray(centers, dtype=float).reshape(-1, 3)])
+        updated = replace(part, vertices=vertices, faces=faces)
         mesh = trimesh.Trimesh(vertices=updated.vertices, faces=faces, process=False)
         source_vertices, source_faces = provenance[part.part_id]
+        if centers:
+            source_vertices = np.r_[source_vertices.astype(np.int64), np.full(len(centers), -1, dtype=np.int64)]
         flags = np.r_[np.full(len(base), -1, dtype=np.int64), np.asarray(cap_ids, dtype=np.int64)]
-        cap_triangles = part.vertices[faces[len(base):]]
+        cap_triangles = updated.vertices[faces[len(base):]]
         extent = overlap_frame(before.vertices)["scale"]
         doubled_areas = np.linalg.norm(np.cross((cap_triangles[:, 1] - cap_triangles[:, 0]) / extent,
                                                 (cap_triangles[:, 2] - cap_triangles[:, 0]) / extent), axis=1)
@@ -503,14 +542,16 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
             pairs = np.asarray(report["pairs"], dtype=np.int64).reshape(-1, 2)
             cap_pairs = pairs[np.any(pairs >= len(base), axis=1)]
         remaining, _ = _boundary(faces)
-        remaining_cut = sum(tuple(sorted(map(int, local_sources[part.part_id][edge]))) in cuts[part.part_id] for edge in remaining)
+        remaining_cut = sum(tuple(sorted(map(int, local_sources[part.part_id][edge]))) in cuts[part.part_id]
+                            for edge in remaining if np.all(edge < len(part.vertices)))
         statistics = {"part_id": part.part_id, "name": part.name, "closed_sections": len(closed), "closed_loops": sum(c["loops"] for c in closed),
             "sections": closed, "skipped": skipped, "loop_planarity": loop_planarity,
             "nonplanar_sections": sum(c["nonplanar"] for c in closed), "cut_boundary_edges_before": int(is_cut.sum()),
             "cut_boundary_edges_after": int(remaining_cut), "original_open_edges": original_open_count,
             "other_boundary_edges": int((~is_cut).sum()) - original_open_count,
             "remaining_boundary_edges": len(remaining), "ambiguous_source_edges": ambiguous[part.part_id],
-            "nonmanifold_edges": nonmanifold, "added_faces": len(added),
+            "nonmanifold_edges": nonmanifold, "added_faces": len(added), "added_vertices": len(centers),
+            "projected_problem_sections": sum(not c["triangulation"].get("projected_coverage_valid", True) for c in closed),
             "degenerate_cap_faces": len(degenerate), "degenerate_cap_face_ids": degenerate,
             "welded_seam_vertices": len(representatives) - len(set(representatives)),
             "is_watertight": bool(mesh.is_watertight) if len(faces) else False,
@@ -522,6 +563,8 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
         raise ValueError("開始頂点の対象断面を現在の編集形状で特定できません。境界のつながりを確認してください。")
     statistics = {"method": METHOD, "max_planarity": max_planarity, "allow_nonplanar": allow_nonplanar, "triangulation": triangulation,
                   "start_offsets": offsets,
+                  "added_vertices": sum(p.statistics["added_vertices"] for p in result),
+                  "projected_problem_sections": sum(p.statistics["projected_problem_sections"] for p in result),
                   "degenerate_cap_faces": sum(p.statistics["degenerate_cap_faces"] for p in result),
                   "nonplanar_sections": sum(p.statistics["nonplanar_sections"] for p in result),
                   "closed_sections": sum(p.statistics["closed_sections"] for p in result),
@@ -547,7 +590,8 @@ def capped_payloads(result, *, part_id=None, highlight_caps=False, show_overlaps
 
 
 def _export_metadata(result, source_key, editing_metadata):
-    return {"format_version": 1, "method": METHOD, "editor_source_key": source_key, "editing": editing_metadata,
+    return {"format_version": 2, "method": METHOD, "editor_source_key": source_key, "editing": editing_metadata,
+            "generated_vertex_source_index": -1,
             "statistics": result.statistics, "parts": [{"part_id": r.part.part_id, "name": r.part.name,
                 "color": r.part.color, "npz_prefix": f"part_{r.part.part_id:04d}",
                 "geometry_name": r.part.geometry_name, "node_name": r.part.node_name} for r in result.parts]}
@@ -562,7 +606,8 @@ def export_capped_glb(result, *, source_key, editing_metadata):
             continue
         mesh = trimesh.Trimesh(vertices=part.vertices.copy(), faces=part.faces.copy(), process=False)
         mesh.visual.face_colors = trimesh.visual.color.hex_to_rgba(part.color)
-        mesh.metadata.update(part_id=part.part_id, part_name=part.name, cap_face_indices=np.flatnonzero(record.is_cap).tolist())
+        mesh.metadata.update(part_id=part.part_id, part_name=part.name, cap_face_indices=np.flatnonzero(record.is_cap).tolist(),
+                             cap_center_vertex_indices=np.flatnonzero(record.is_cap_center).tolist())
         scene.add_geometry(mesh, geom_name=part.geometry_name, node_name=part.node_name, transform=np.eye(4))
     return scene.export(file_type="glb")
 
@@ -574,6 +619,7 @@ def export_capped_npz(result, *, source_key, editing_metadata):
         prefix = f"part_{part.part_id:04d}"
         arrays.update({f"{prefix}_vertices": part.vertices, f"{prefix}_faces": part.faces,
             f"{prefix}_source_vertex_indices": record.source_vertex_indices,
+            f"{prefix}_is_cap_center": record.is_cap_center,
             f"{prefix}_source_face_indices": record.source_face_indices,
             f"{prefix}_face_part_ids": np.full(len(part.faces), part.part_id, dtype=np.int32),
             f"{prefix}_face_colors": np.tile(trimesh.visual.color.hex_to_rgba(part.color), (len(part.faces), 1)),

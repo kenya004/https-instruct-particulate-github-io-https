@@ -207,6 +207,108 @@ class StartVertexTests(unittest.TestCase):
                 cap_parts(content, manifest, parts, parts, start_offsets=offsets)
 
 
+class CenterFanTests(unittest.TestCase):
+    def test_each_cut_gets_one_weighted_center_and_preserves_source_surface(self):
+        section = [[0, 0], [1, 0], [4, 0], [4, 2], [0, 2]]
+        end_faces = [[0, 1, 4], [1, 3, 4], [1, 2, 3]]
+        manifest, content, parts = pack(*prism(section, end_faces))
+        catalog = cut_loop_catalog(content, manifest, parts)
+        edited = tuple(replace(p, vertices=p.vertices * (1 + p.part_id / 5) + [2, p.part_id, 3]) for p in parts)
+        result = cap_parts(content, manifest, parts, edited, triangulation="center_fan")
+        self.assertEqual(result.statistics["added_vertices"], 4)
+        self.assertEqual(result.statistics["added_faces"], 20)
+        self.assertEqual(result.statistics["projected_problem_sections"], 0)
+        with np.load(io.BytesIO(content), allow_pickle=False) as data:
+            for record, current, original in zip(result.parts, edited, parts):
+                count = record.statistics["closed_sections"]
+                self.assertEqual(len(record.part.vertices), len(current.vertices) + count)
+                np.testing.assert_array_equal(record.part.vertices[:len(current.vertices)], current.vertices)
+                np.testing.assert_array_equal(record.part.faces[:len(current.faces)], current.faces)
+                np.testing.assert_array_equal(record.source_vertex_indices[:len(current.vertices)],
+                                              data[f"part_{current.part_id:04d}_source_vertex_indices"])
+                self.assertTrue(np.all(record.source_vertex_indices[record.is_cap_center] == -1))
+                self.assertEqual(int(record.is_cap_center.sum()), count)
+                self.assertTrue(record.statistics["is_watertight"])
+                self.assertTrue(record.statistics["is_winding_consistent"])
+                self.assertEqual(record.statistics["cap_overlap_pair_count"], 0)
+                for cap in record.statistics["sections"]:
+                    info = cap["triangulation"]
+                    target = next(item for item in catalog if item["loop_key"] == cap["start_vertices"][0]["loop_key"])
+                    boundary = current.vertices[target["vertices"]]
+                    following = np.roll(boundary, -1, axis=0)
+                    lengths = np.linalg.norm(following - boundary, axis=1)
+                    expected = np.sum((boundary + following) / 2 * (lengths / lengths.sum())[:, None], axis=0)
+                    np.testing.assert_allclose(record.part.vertices[info["center_vertex"]], expected)
+                    self.assertFalse(np.allclose(expected, boundary.mean(axis=0)))
+                    faces = record.part.faces[record.cap_ids == cap["cap_id"]]
+                    self.assertEqual(len(faces), len(boundary))
+                    self.assertTrue(np.all(faces[:, 0] == info["center_vertex"]))
+                # The input NPZ and unedited arrays remain unchanged.
+                np.testing.assert_array_equal(original.vertices, data[f"part_{original.part_id:04d}_vertices"])
+
+    def test_fan_is_independent_of_requested_start_and_nonplanar_vertices_stay_in_3d(self):
+        manifest, content, parts = pack(*nonplanar_prism())
+        catalog = cut_loop_catalog(content, manifest, parts)
+        withheld = cap_parts(content, manifest, parts, parts, triangulation="center_fan")
+        self.assertEqual(withheld.statistics["added_vertices"], 0)
+        result = cap_parts(content, manifest, parts, parts, allow_nonplanar=True, triangulation="center_fan")
+        shifted = cap_parts(content, manifest, parts, parts, allow_nonplanar=True, triangulation="center_fan",
+                            start_offsets={item["loop_key"]: 3 for item in catalog})
+        self.assertEqual(result.statistics["nonplanar_sections"], 4)
+        self.assertEqual(result.statistics["added_vertices"], 4)
+        self.assertEqual(result.statistics["added_faces"], 32)
+        self.assertEqual(shifted.statistics["start_offsets"], {})
+        for first, second, original in zip(result.parts, shifted.parts, parts):
+            np.testing.assert_array_equal(first.part.vertices[:len(original.vertices)], original.vertices)
+            np.testing.assert_array_equal(first.part.vertices, second.part.vertices)
+            np.testing.assert_array_equal(first.part.faces, second.part.faces)
+            self.assertTrue(first.statistics["is_watertight"])
+
+    def test_concave_footprint_problems_are_reported_without_removing_fan(self):
+        # A U-shaped section: its boundary centroid cannot see the full outline.
+        section = [[0, 0], [3, 0], [3, 3], [2, 3], [2, 1], [1, 1], [1, 3], [0, 3]]
+        end_faces = [[0, 1, 4], [1, 2, 3], [1, 3, 4], [0, 4, 5], [0, 5, 7], [5, 6, 7]]
+        manifest, content, parts = pack(*prism(section, end_faces))
+        result = cap_parts(content, manifest, parts, parts, triangulation="center_fan")
+        self.assertEqual(result.statistics["closed_sections"], 4)
+        self.assertEqual(result.statistics["added_vertices"], 4)
+        self.assertEqual(result.statistics["projected_problem_sections"], 4)
+        self.assertTrue(all(p.statistics["is_watertight"] for p in result.parts))
+        self.assertTrue(all(p.statistics["cap_overlap_pair_count"] > 0 for p in result.parts))
+        self.assertIn("#e12b35", capped_payloads(result)[0]["face_colors"])
+
+    def test_hollow_section_is_preserved_without_unused_center_vertices(self):
+        manifest, content, parts = pack(*hollow_prism())
+        result = cap_parts(content, manifest, parts, parts, triangulation="center_fan")
+        self.assertEqual(result.statistics["added_faces"], 0)
+        self.assertEqual(result.statistics["added_vertices"], 0)
+        self.assertEqual(result.statistics["skipped_sections"], 4)
+        for record, original in zip(result.parts, parts):
+            np.testing.assert_array_equal(record.part.vertices, original.vertices)
+            self.assertTrue(all("Earcut" in skipped["reason"] for skipped in record.statistics["skipped"]))
+
+    def test_export_preserves_new_centers_source_mapping_and_semantic_colors(self):
+        manifest, content, parts = pack(*prism())
+        result = cap_parts(content, manifest, parts, parts, triangulation="center_fan")
+        scene = trimesh.load(io.BytesIO(export_capped_glb(result, source_key="fan", editing_metadata={})),
+                             file_type="glb", process=False)
+        with np.load(io.BytesIO(export_capped_npz(result, source_key="fan", editing_metadata={})), allow_pickle=False) as data:
+            saved = json.loads(data["metadata_json"].item())
+            self.assertEqual(saved["format_version"], 2)
+            self.assertEqual(saved["statistics"]["added_vertices"], 4)
+            for record in result.parts:
+                part, prefix = record.part, f"part_{record.part.part_id:04d}"
+                mesh = scene.geometry[part.geometry_name]
+                np.testing.assert_allclose(mesh.vertices, part.vertices)
+                np.testing.assert_array_equal(mesh.faces, part.faces)
+                self.assertEqual(mesh.metadata["cap_center_vertex_indices"], np.flatnonzero(record.is_cap_center).tolist())
+                np.testing.assert_array_equal(data[f"{prefix}_is_cap_center"], record.is_cap_center)
+                self.assertEqual(data[f"{prefix}_source_vertex_indices"].shape, (len(part.vertices),))
+                np.testing.assert_array_equal(data[f"{prefix}_source_face_indices"], record.source_face_indices)
+                np.testing.assert_array_equal(mesh.visual.face_colors,
+                                              np.tile(trimesh.visual.color.hex_to_rgba(part.color), (len(part.faces), 1)))
+
+
 class CutCappingTests(unittest.TestCase):
     def test_two_separate_cuts_are_closed_on_each_independent_part(self):
         manifest, content, parts = pack(*prism())
@@ -492,6 +594,45 @@ def capping_editor_app(manifest, content):
 
 
 class CutCappingInterfaceTests(unittest.TestCase):
+    def test_center_fan_preview_exports_and_switching_keep_other_start_settings(self):
+        from streamlit.testing.v1 import AppTest
+        manifest, content, _ = pack(*prism())
+        app = AppTest.from_function(capping_editor_app, args=(manifest, content), default_timeout=30).run()
+        app.button(key="cap_start_next").click().run()
+        prior_offsets = app.session_state["part_editing"]["cap_start_offsets"].copy()
+        app.selectbox(key="cap_triangulation").set_value("center_fan").run()
+        self.assertNotIn("capped", app.session_state["part_editing"])
+        self.assertTrue(app.button(key="cap_start_next").disabled)
+        self.assertTrue(app.button(key="cap_start_reset").disabled)
+        app.button(key="cap_parts").click().run()
+        state = app.session_state["part_editing"]
+        self.assertEqual(state["capped"]["result"].statistics["added_vertices"], 4)
+        self.assertEqual(state["cap_start_offsets"], prior_offsets)
+        self.assertEqual(state["capped"]["result"].statistics["start_offsets"], {})
+        self.assertGreater(len(state["capped"]["glb"]), 0)
+        self.assertGreater(len(state["capped"]["npz"]), 0)
+        figure = json.loads(app.get("plotly_chart")[-1].proto.spec)
+        centers = next(trace for trace in figure["data"] if trace.get("name") == "断面中心")
+        self.assertEqual(centers["text"], ["O"] * 4)
+        self.assertFalse(any(trace.get("name") == "開始頂点" for trace in figure["data"]))
+        self.assertEqual(figure["layout"]["scene"]["dragmode"], "turntable")
+        app.selectbox(key="capped_part_view").set_value(1).run()
+        figure = json.loads(app.get("plotly_chart")[-1].proto.spec)
+        centers = next(trace for trace in figure["data"] if trace.get("name") == "断面中心")
+        self.assertEqual(len(centers["text"]), 2)
+        app.checkbox(key="show_cap_centers").set_value(False).run()
+        self.assertIn("capped", app.session_state["part_editing"])
+        figure = json.loads(app.get("plotly_chart")[-1].proto.spec)
+        self.assertFalse(any(trace.get("name") == "断面中心" for trace in figure["data"]))
+        app.button(key="rejoin_mesh").click().run()
+        self.assertEqual(app.session_state["part_editing"]["rejoined"]["result"].statistics["bridge_faces"], 0)
+        app.selectbox(key="cap_triangulation").set_value("point_only").run()
+        self.assertFalse(app.button(key="cap_start_next").disabled)
+        self.assertEqual(app.session_state["part_editing"]["cap_start_offsets"], prior_offsets)
+        self.assertNotIn("capped", app.session_state["part_editing"])
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(app.error), 0)
+
     def test_next_start_regenerates_selected_cut_repeatedly_and_reset_keeps_other_cuts(self):
         from streamlit.testing.v1 import AppTest
         manifest, content, parts = pack(*prism())
