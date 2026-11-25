@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import trimesh
 
-from capping import cap_parts, capped_payloads, export_capped_glb, export_capped_npz
+from capping import _triangulate_point_only, cap_parts, capped_payloads, cut_loop_catalog, export_capped_glb, export_capped_npz
 from editing import load_editable_parts
 
 
@@ -69,6 +69,142 @@ def nonplanar_prism():
     # Eight-edge cuts with >10% nonplanarity, comparable to the reported case.
     vertices[cuts, 0] += .4 * np.sin(2 * np.arctan2(vertices[cuts, 2], vertices[cuts, 1]))
     return vertices, faces, labels
+
+
+class PointOnlyTriangulationTests(unittest.TestCase):
+    frame = {"center": np.zeros(3), "basis": np.array([[1, 0, 0], [0, 1, 0]]), "scale": 1.0}
+
+    def test_concave_middle_vertex_is_accepted_even_outside_projected_polygon(self):
+        vertices = np.array([[3, 3, 0], [1.5, 1.5, 1], [0, 3, 0], [0, 0, 0], [3, 0, 0]])
+        triangles, info = _triangulate_point_only(vertices, [np.arange(5)], self.frame)
+        np.testing.assert_array_equal(triangles[0], [0, 2, 1])
+        self.assertEqual(info["rejected_interior"], 0)
+        self.assertFalse(info["convexity_check"])
+        self.assertFalse(info["triangle_area_check"])
+
+    def test_another_remaining_vertex_strictly_inside_still_rejects_candidate(self):
+        vertices = np.array([[0, 0, 0], [3, 0, 0], [0, 3, 0], [.5, .5, 0], [-1, 1, 0]])
+        triangles, info = _triangulate_point_only(vertices, [np.arange(5)], self.frame)
+        self.assertEqual(info["candidate_sample"][0], {"vertices": [0, 1, 2], "accepted": False, "interior_vertices": [3]})
+        self.assertGreater(info["rejected_interior"], 0)
+        self.assertFalse(any(set(face) == {0, 1, 2} for face in triangles))
+        self.assertEqual(len(triangles), 3)
+
+    def test_projected_coincidence_keeps_distinct_3d_vertices_and_zero_2d_area_face(self):
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [1, 0, 1], [1, 1, 0], [0, 1, 0]])
+        triangles, info = _triangulate_point_only(vertices, [np.arange(5)], self.frame)
+        np.testing.assert_array_equal(triangles[0], [0, 2, 1])
+        first = vertices[triangles[0]]
+        self.assertAlmostEqual(np.linalg.norm(np.cross(first[1] - first[0], first[2] - first[0])) / 2, .5)
+        self.assertEqual(info["accepted_candidates"], 3)
+        self.assertEqual(set(triangles.reshape(-1)), set(range(5)))
+
+    def test_zero_3d_area_is_retained_and_recorded_instead_of_rejected(self):
+        section = [[0, 0], [1, 0], [2, 0], [2, 2], [0, 2]]
+        end_faces = [[0, 1, 4], [1, 3, 4], [1, 2, 3]]
+        manifest, content, parts = pack(*prism(section, end_faces))
+        result = cap_parts(content, manifest, parts, parts, triangulation="point_only")
+        self.assertEqual(result.statistics["closed_sections"], 4)
+        self.assertGreater(result.statistics["degenerate_cap_faces"], 0)
+        for record, original in zip(result.parts, parts):
+            np.testing.assert_array_equal(record.part.vertices, original.vertices)
+            self.assertEqual(len(record.part.faces) - len(original.faces), 3 * record.statistics["closed_sections"])
+            for face in record.statistics["degenerate_cap_face_ids"]:
+                self.assertTrue(record.is_cap[face])
+        with np.load(io.BytesIO(export_capped_npz(result, source_key="point-only", editing_metadata={})), allow_pickle=False) as data:
+            saved = json.loads(data["metadata_json"].item())
+            self.assertEqual(saved["statistics"]["triangulation"], "point_only")
+            self.assertGreater(saved["statistics"]["degenerate_cap_faces"], 0)
+
+    def test_hollow_sections_are_not_filled_as_disks_by_experimental_method(self):
+        manifest, content, parts = pack(*hollow_prism())
+        result = cap_parts(content, manifest, parts, parts, triangulation="point_only")
+        self.assertEqual(result.statistics["added_faces"], 0)
+        self.assertEqual(result.statistics["skipped_sections"], 4)
+        self.assertTrue(all("Earcut" in skipped["reason"] for p in result.parts for skipped in p.statistics["skipped"]))
+        conventional = cap_parts(content, manifest, parts, parts, triangulation="earcut")
+        self.assertEqual(conventional.statistics["closed_sections"], 4)
+
+
+class StartVertexTests(unittest.TestCase):
+    def test_only_selected_cut_changes_and_current_geometry_is_preserved(self):
+        manifest, content, parts = pack(*nonplanar_prism())
+        catalog = cut_loop_catalog(content, manifest, parts)
+        self.assertEqual([item["part_id"] for item in catalog], [0, 1, 1, 2])
+        self.assertEqual(len({item["loop_key"] for item in catalog}), 4)
+        target = catalog[1]
+        edited = tuple(replace(p, vertices=p.vertices * 1.3 + [2, 3, 4]) for p in parts)
+        baseline = cap_parts(content, manifest, parts, edited, allow_nonplanar=True, triangulation="point_only")
+        shifted = cap_parts(content, manifest, parts, edited, allow_nonplanar=True, triangulation="point_only",
+                            start_offsets={target["loop_key"]: 1})
+        changed = 0
+        for before, after, current in zip(baseline.parts, shifted.parts, edited):
+            np.testing.assert_array_equal(after.part.vertices, current.vertices)
+            np.testing.assert_array_equal(after.part.faces[:len(current.faces)], current.faces)
+            self.assertTrue(after.statistics["is_watertight"])
+            self.assertTrue(after.statistics["is_winding_consistent"])
+            for first, second in zip(before.statistics["sections"], after.statistics["sections"]):
+                initial, updated = first["start_vertices"][0], second["start_vertices"][0]
+                self.assertEqual(first["planarity"], second["planarity"])
+                first_faces = before.part.faces[before.cap_ids == first["cap_id"]]
+                second_faces = after.part.faces[after.cap_ids == second["cap_id"]]
+                if initial["loop_key"] == target["loop_key"]:
+                    expected = target["vertices"][1:4]
+                    self.assertEqual(updated["first_candidate"], expected)
+                    self.assertEqual(updated["start_offset"], 1)
+                    self.assertEqual(second["triangulation"]["candidate_sample"][0]["vertices"], expected)
+                    self.assertFalse(np.array_equal(first_faces, second_faces))
+                    changed += 1
+                else:
+                    self.assertEqual(initial, updated)
+                    np.testing.assert_array_equal(first_faces, second_faces)
+        self.assertEqual(changed, 1)
+        with np.load(io.BytesIO(export_capped_npz(shifted, source_key="start-test", editing_metadata={})), allow_pickle=False) as data:
+            saved = json.loads(data["metadata_json"].item())
+        self.assertEqual(saved["statistics"]["start_offsets"], {target["loop_key"]: 1})
+
+    def test_start_cycles_through_every_boundary_vertex_and_returns_to_original(self):
+        manifest, content, parts = pack(*prism())
+        target = cut_loop_catalog(content, manifest, parts)[0]
+        baseline = cap_parts(content, manifest, parts, parts, triangulation="point_only")
+        for offset in range(target["vertex_count"] + 1):
+            result = cap_parts(content, manifest, parts, parts, triangulation="point_only",
+                               start_offsets={target["loop_key"]: offset})
+            loop = result.parts[0].statistics["loop_planarity"][0]
+            self.assertEqual(loop["start_vertex"], target["vertices"][offset % target["vertex_count"]])
+            self.assertEqual(loop["start_offset"], offset % target["vertex_count"])
+        self.assertEqual(result.statistics["start_offsets"], {})
+        for before, after in zip(baseline.parts, result.parts):
+            np.testing.assert_array_equal(before.part.faces, after.part.faces)
+
+    def test_earcut_inner_loop_start_preserves_hollow_sections(self):
+        manifest, content, parts = pack(*hollow_prism())
+        catalog = cut_loop_catalog(content, manifest, parts)
+        result = cap_parts(content, manifest, parts, parts, triangulation="earcut",
+                           start_offsets={item["loop_key"]: 1 for item in catalog})
+        self.assertEqual(result.statistics["closed_sections"], 4)
+        self.assertEqual(result.statistics["closed_loops"], 8)
+        self.assertEqual(result.statistics["added_faces"], 32)
+        for record in result.parts:
+            self.assertTrue(record.statistics["is_watertight"])
+            self.assertTrue(record.statistics["is_winding_consistent"])
+            self.assertTrue(all(section["holes"] == 1 for section in record.statistics["sections"]))
+
+    def test_skipped_nonplanar_loop_still_records_selected_start(self):
+        manifest, content, parts = pack(*nonplanar_prism())
+        target = cut_loop_catalog(content, manifest, parts)[0]
+        result = cap_parts(content, manifest, parts, parts, start_offsets={target["loop_key"]: 2})
+        self.assertEqual(result.statistics["added_faces"], 0)
+        info = result.parts[0].statistics["loop_planarity"][0]
+        self.assertEqual(info["start_offset"], 2)
+        self.assertEqual(info["start_vertex"], target["vertices"][2])
+
+    def test_invalid_start_settings_are_rejected(self):
+        manifest, content, parts = pack(*prism())
+        loop_key = cut_loop_catalog(content, manifest, parts)[0]["loop_key"]
+        for offsets in ([0], {loop_key: True}, {loop_key: "1"}, {"unknown": 1}):
+            with self.subTest(offsets=offsets), self.assertRaisesRegex(ValueError, "開始頂点"):
+                cap_parts(content, manifest, parts, parts, start_offsets=offsets)
 
 
 class CutCappingTests(unittest.TestCase):
@@ -356,6 +492,55 @@ def capping_editor_app(manifest, content):
 
 
 class CutCappingInterfaceTests(unittest.TestCase):
+    def test_next_start_regenerates_selected_cut_repeatedly_and_reset_keeps_other_cuts(self):
+        from streamlit.testing.v1 import AppTest
+        manifest, content, parts = pack(*prism())
+        catalog = cut_loop_catalog(content, manifest, parts)
+        app = AppTest.from_function(capping_editor_app, args=(manifest, content), default_timeout=30).run()
+        state = app.session_state["part_editing"]
+        selector = f"cap_start_loop_{state['source_key']}"
+        self.assertNotIn("capped", state)
+        app.button(key="cap_start_next").click().run()
+        state = app.session_state["part_editing"]
+        self.assertEqual(state["cap_start_offsets"], {catalog[0]["loop_key"]: 1})
+        saved_key = state["capped"]["input_key"]
+        app.selectbox(key=selector).set_value(catalog[1]["loop_key"]).run()
+        self.assertEqual(app.session_state["part_editing"]["capped"]["input_key"], saved_key)
+        app.button(key="cap_start_next").click().run()
+        self.assertEqual(app.session_state["part_editing"]["cap_start_offsets"],
+                         {catalog[0]["loop_key"]: 1, catalog[1]["loop_key"]: 1})
+        for _ in range(catalog[1]["vertex_count"]):
+            app.button(key="cap_start_next").click().run()
+        self.assertEqual(app.session_state["part_editing"]["cap_start_offsets"][catalog[1]["loop_key"]], 1)
+        app.button(key="cap_start_reset").click().run()
+        state = app.session_state["part_editing"]
+        self.assertEqual(state["cap_start_offsets"], {catalog[0]["loop_key"]: 1})
+        self.assertEqual(state["capped"]["result"].statistics["start_offsets"], state["cap_start_offsets"])
+        self.assertTrue(any("開始位置：1/4" in caption.value for caption in app.caption))
+        figure = json.loads(app.get("plotly_chart")[-1].proto.spec)
+        marker = next(trace for trace in figure["data"] if trace.get("name") == "開始頂点")
+        self.assertEqual(marker["text"], ["A"])
+        self.assertEqual(figure["layout"]["scene"]["dragmode"], "turntable")
+        app.selectbox(key="capped_part_view").set_value(2).run()
+        figure = json.loads(app.get("plotly_chart")[-1].proto.spec)
+        self.assertFalse(any(trace.get("name") == "開始頂点" for trace in figure["data"]))
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(app.error), 0)
+
+    def test_triangle_method_defaults_to_point_only_and_switch_invalidates_caps(self):
+        from streamlit.testing.v1 import AppTest
+        manifest, content, _ = pack(*prism())
+        app = AppTest.from_function(capping_editor_app, args=(manifest, content), default_timeout=30).run()
+        self.assertEqual(app.selectbox(key="cap_triangulation").value, "point_only")
+        app.button(key="cap_parts").click().run()
+        self.assertEqual(app.session_state["part_editing"]["capped"]["result"].statistics["triangulation"], "point_only")
+        app.selectbox(key="cap_triangulation").set_value("earcut").run()
+        self.assertNotIn("capped", app.session_state["part_editing"])
+        app.button(key="cap_parts").click().run()
+        self.assertEqual(app.session_state["part_editing"]["capped"]["result"].statistics["triangulation"], "earcut")
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(app.error), 0)
+
     def test_nonplanar_toggle_invalidates_caps_and_exposes_measurements(self):
         from streamlit.testing.v1 import AppTest
         manifest, content, _ = pack(*nonplanar_prism())
