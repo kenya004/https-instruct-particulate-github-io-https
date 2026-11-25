@@ -152,6 +152,8 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
     show_overlaps = st.checkbox("Faceの重なりを表示", value=True, key=f"show_overlaps_{source_key}")
     st.caption("未編集時にはない新しい交差ペアのFaceだけを赤く表示します。判定はスライダーを離した後に更新します。編集は制限せず、保存するモデルは元のパーツ色を保持します。")
     movement = translation_controls(parts)
+    # Narrow the displayed controls while preserving validation of earlier edits.
+    movement = {name: value * .2 for name, value in movement.items()}
     st.caption(f"全体移動は接触を維持しません。断面固定移動は操作前の境界を固定します。軸の矢印は赤＝U、緑＝V、青＝N。断面がないパーツは入力XYZです。入力座標の単位で各軸 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
     if follow and connections:
         edited, automatic = follow_connections(parts, state["scales"], plan)

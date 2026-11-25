@@ -13,8 +13,9 @@ import { bindZeroDetent } from "./zero_detent.js";
 const viewport = document.getElementById("viewport");
 const sliderList = document.getElementById("sliders");
 const errorBox = document.getElementById("error");
-const MIN = 0.1;
-const MAX = 3.0;
+const MIN = 0.5;
+const MAX = 1.5;
+const SCALE_STEP = 0.001;
 let sourceKey = null;
 let sequence = 0;
 let scales = {};
@@ -224,8 +225,15 @@ function updateScale(partId, value, redraw = true) {
   scales[id] = value;
   const widget = widgets.get(id);
   if (widget) {
+    if (!redraw) {
+      // Keep existing edits visible when they exceed the narrower default range.
+      widget.input.min = String(Math.min(MIN, Math.floor(value / SCALE_STEP) * SCALE_STEP));
+      widget.input.max = String(Math.max(MAX, Math.ceil(value / SCALE_STEP) * SCALE_STEP));
+      widget.scaleEndpoints[0].textContent = Number(widget.input.min).toFixed(3);
+      widget.scaleEndpoints[1].textContent = Number(widget.input.max).toFixed(3);
+    }
     widget.input.value = String(value);
-    widget.output.value = `${value.toFixed(2)}×`;
+    widget.output.value = `${value.toFixed(3)}×`;
   }
   if (redraw) {
     pendingOverlaps = true;
@@ -367,7 +375,7 @@ function rebuild(args) {
     input.id = `scale-${id}`;
     input.min = String(MIN);
     input.max = String(MAX);
-    input.step = "0.01";
+    input.step = String(SCALE_STEP);
     input.value = String(scales[id] ?? 1);
     input.disabled = empty;
     input.setAttribute("aria-label", part.name);
@@ -385,10 +393,12 @@ function rebuild(args) {
     }
     const endpoints = document.createElement("div");
     endpoints.className = "endpoints";
-    for (const text of ["0.10", "3.00"]) {
+    const scaleEndpoints = [];
+    for (const value of [MIN, MAX]) {
       const span = document.createElement("span");
-      span.textContent = text;
+      span.textContent = value.toFixed(3);
       endpoints.appendChild(span);
+      scaleEndpoints.push(span);
     }
     row.appendChild(endpoints);
     const motionLabel = document.createElement("div");
@@ -427,7 +437,7 @@ function rebuild(args) {
       moveOutputs.push(moveOutput);
     }
     sliderList.appendChild(row);
-    widgets.set(id, { input, output, empty, moveInputs, moveOutputs, moveDetents });
+    widgets.set(id, { input, output, empty, scaleEndpoints, moveInputs, moveOutputs, moveDetents });
     if (!empty && renderer) {
       const center = new THREE.Vector3(...part.center);
       const positions = new Float32Array(part.vertices.length * 3);
