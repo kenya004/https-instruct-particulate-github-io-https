@@ -13,6 +13,8 @@ from editing import validate_scales
 
 
 METHOD = "reference_surface_blend_v3"
+EDIT_METHOD = "edited_part_surface_blend_v4"
+EDIT_APPLICATION = "edited_part"
 DISTANCE_BASIS = "reference_triangle_surface"
 RANGE_BASIS = "part_aabb_longest_side"
 DEFAULT_RATIO = .6
@@ -260,6 +262,60 @@ def build_blend_distances(content, manifest, parts, connections, selected_ids, r
     return payload
 
 
+def build_edit_blend_distances(content, manifest, parts, connections, selected_ids):
+    """Prepare each editing candidate's weights toward its actual neighbors.
+
+    Both sides may be candidates. Each uses the other side's surface; neither
+    becomes a fixed root just because its ID or the edit order comes first.
+    """
+    selected = set(selected_ids)
+    by_id = {part.part_id: part for part in parts}
+    if any(type(i) is not int or i not in by_id or not len(by_id[i].faces) for i in selected):
+        raise ValueError("境界なじませの対象パーツが不正です。")
+    payload = {"method": EDIT_METHOD, "application": EDIT_APPLICATION,
+               "distance_basis": DISTANCE_BASIS, "range_basis": RANGE_BASIS,
+               "selected_ids": sorted(selected), "parts": {}, "anchors": {},
+               "reference_checks": [], "warnings": []}
+    if not selected:
+        return payload
+    points, local_ids = boundary_geometry(content, manifest, parts)
+    seeds = defaultdict(lambda: defaultdict(set))
+    for connection in connections:
+        for source, neighbor in ((connection.part_a, connection.part_b), (connection.part_b, connection.part_a)):
+            for edge in connection.boundary_edges:
+                for vertex in edge:
+                    seeds[source][vertex].add(neighbor)
+    queries = _SurfaceQueries(parts)
+    for part_id in sorted(selected):
+        owners = {vertex: min(neighbors) for vertex, neighbors in seeds[part_id].items()}
+        field = reference_distance_field(points, local_ids[part_id], by_id[part_id], owners, queries)
+        if field is None:
+            payload["warnings"].append(f"{by_id[part_id].name}: 対応する共有境界がないため、従来の変形を使います。")
+            continue
+        payload["parts"][str(part_id)] = field
+        if any(len(neighbors) > 1 for neighbors in seeds[part_id].values()):
+            payload["warnings"].append(f"{by_id[part_id].name}: 同じ境界頂点に複数の接続先がある箇所は、パーツID順で相手を選びます。")
+    payload["anchors"] = boundary_anchor_samples(points, local_ids, connections)
+    return payload
+
+
+def edit_blend_responses(blending, network, follow=True):
+    """Attach the neighbor's response to this part's own unit scale change.
+
+    Other parts' scale changes stay in the baseline automatic translation.
+    This avoids blending their edits again or changing targets on slider focus.
+    """
+    if blending.get("application") != EDIT_APPLICATION:
+        raise ValueError("編集パーツのなじませデータが不正です。")
+    responses = {(r["source_id"], r["target_id"]): r["displacement"] for r in network["responses"]} if follow else {}
+    specs = {}
+    for part_id, spec in blending["parts"].items():
+        specs[part_id] = {**spec, "application": EDIT_APPLICATION, "influences": [
+            {**influence, "scale_displacement": responses.get((int(part_id), influence["reference_part_id"]), [0., 0., 0.])}
+            for influence in spec["influences"]]}
+    return {**blending, "parts": specs, "following_enabled": bool(follow)}
+
+
 def blend_weights(distances, ratio=DEFAULT_RATIO):
     """Change the transition width without repeating any surface queries."""
     if type(ratio) not in (int, float) or not np.isfinite(ratio) or not 0 < ratio <= 1:
@@ -306,8 +362,15 @@ def apply_boundary_blend(parts, baseline, scales, automatic, payload):
     for part, current in zip(parts, baseline):
         vertices = current.vertices.copy()
         for influence in payload.get("parts", {}).get(str(part.part_id), {}).get("influences", []):
-            reference = by_id[influence["reference_part_id"]]
             weights = np.asarray(influence["weights"], dtype=float)
+            if payload.get("application") == EDIT_APPLICATION:
+                # Only this part's own edit is attenuated. Contributions from
+                # every other source remain unchanged in current.vertices.
+                delta = scales[str(part.part_id)] - 1
+                displacement = np.asarray(influence["scale_displacement"], dtype=float)
+                vertices += (delta * weights)[:, None] * (displacement - (part.vertices - part.center))
+                continue
+            reference = by_id[influence["reference_part_id"]]
             # Preserve original coordinates exactly when scale is 1 and the
             # automatic displacement is 0, including very thin boundaries.
             target = part.vertices + (scales[str(reference.part_id)] - 1) * (part.vertices - reference.center) + automatic[reference.part_id]
@@ -338,6 +401,8 @@ def blend_metadata(payload, parts, scales, automatic):
             point = np.asarray(check["point"])
             targets.append(point + (scales[str(part_id)] - 1) * (point - part.center) + automatic[part_id])
         conflicts += any(np.linalg.norm(point - targets[0]) > tolerance for point in targets[1:])
-    return {"method": payload["method"], "distance_basis": payload["distance_basis"], "range_basis": payload["range_basis"], "selected_ids": payload["selected_ids"], "ratio": payload["ratio"],
+    return {"method": payload["method"], "application": payload.get("application", "fixed_reference"),
+            "active_scale_ids": [int(i) for i in payload["parts"] if scales[i] != 1],
+            "distance_basis": payload["distance_basis"], "range_basis": payload["range_basis"], "selected_ids": payload["selected_ids"], "ratio": payload["ratio"],
             "parts": [{key: value for key, value in item.items() if key != "influences"} for item in payload["parts"].values()],
             "conflicting_fixed_vertices": conflicts}

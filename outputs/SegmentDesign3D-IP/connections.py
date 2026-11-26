@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from editing import EditablePart, scale_parts, validate_scales
+from connection_planes import FOLLOW_METHOD, NETWORK_FOLLOW_METHOD, boundary_plane, contact_plane_response
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,8 @@ class Connection:
     boundary_length: float
     edge_count: int
     boundary_edges: tuple[tuple[int, int], ...] = ()
+    plane_normal: np.ndarray | None = None
+    plane_error: float | None = None
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,10 @@ class Attachment:
     parent_id: int
     child_id: int
     connection_id: int
+    planes: tuple[dict, ...]
+    projection: np.ndarray
+    scale_displacement: np.ndarray
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,18 +118,23 @@ def detect_connections(content: bytes, parts: tuple[EditablePart, ...]) -> tuple
                 continue
             anchor = np.sum(segments.mean(axis=1) * (lengths / total)[:, None], axis=0)
             anchor.setflags(write=False)
+            try:
+                _, normal, rms, span = boundary_plane(segments)
+                normal.setflags(write=False)
+                error = rms / span
+            except ValueError:
+                normal, error = None, None
             connections.append(Connection(len(connections), left, right, anchor, total, len(component),
-                                          tuple((int(a), int(b)) for a, b in component)))
+                                          tuple((int(a), int(b)) for a, b in component), normal, error))
     return tuple(connections), warnings
 
 
-def build_connection_plan(parts: tuple[EditablePart, ...], connections: tuple[Connection, ...], root_id: int, preferred_relations=()) -> ConnectionPlan:
+def build_connection_plan(parts: tuple[EditablePart, ...], connections: tuple[Connection, ...], root_id: int, preferred_relations=(), response_cache=None) -> ConnectionPlan:
     ids = sorted(part.part_id for part in parts if len(part.faces))
     if root_id not in ids:
         raise ValueError("基準パーツには面のあるパーツを指定してください。")
     groups = _DisjointSet(ids)
     adjacency = defaultdict(list)
-    unused = []
     # Prefer substantial boundaries; each additional constraint in a cycle is reported.
     preferred = {frozenset((r["parent_id"], r["child_id"])) for r in preferred_relations}
     children = {r["child_id"] for r in preferred_relations}
@@ -133,9 +145,11 @@ def build_connection_plan(parts: tuple[EditablePart, ...], connections: tuple[Co
         if groups.join(connection.part_a, connection.part_b):
             adjacency[connection.part_a].append((connection.part_b, connection.connection_id))
             adjacency[connection.part_b].append((connection.part_a, connection.connection_id))
-        else:
-            unused.append(connection.connection_id)
-    visited, roots, attachments = set(), [], []
+    by_id = {part.part_id: part for part in parts}
+    by_pair = defaultdict(list)
+    for connection in connections:
+        by_pair[frozenset((connection.part_a, connection.part_b))].append(connection)
+    visited, roots, attachments, used = set(), [], [], set()
     for root in [root_id] + [i for i in preferred_roots if i in ids and i != root_id] + [index for index in ids if index != root_id]:
         if root in visited:
             continue
@@ -148,24 +162,72 @@ def build_connection_plan(parts: tuple[EditablePart, ...], connections: tuple[Co
                 if child in visited:
                     continue
                 visited.add(child)
-                attachments.append(Attachment(parent, child, connection_id))
+                pair_connections = by_pair[frozenset((parent, child))]
+                key = (parent, child)
+                if response_cache is not None and key in response_cache:
+                    response = response_cache[key]
+                else:
+                    response = contact_plane_response(pair_connections, by_id[parent], by_id[child])
+                    if response_cache is not None:
+                        response_cache[key] = response
+                planes, projection, displacement, warnings = response
+                attachments.append(Attachment(parent, child, connection_id, planes, projection, displacement, warnings))
+                used.update(index for plane in planes for index in plane["connection_ids"])
                 queue.append(child)
-    return ConnectionPlan(connections, tuple(attachments), tuple(roots), tuple(sorted(unused)))
+    return ConnectionPlan(connections, tuple(attachments), tuple(roots), tuple(sorted({c.connection_id for c in connections} - used)))
+
+
+def _directed_translations(parts, scales, plan):
+    translations = {part.part_id: np.zeros(3) for part in parts}
+    for attachment in plan.attachments:
+        # Only changes on the reference side drive following. The child's own
+        # scale never translates the child or changes its scaling center.
+        translations[attachment.child_id] = (
+            attachment.projection @ translations[attachment.parent_id]
+            + (scales[str(attachment.parent_id)] - 1) * attachment.scale_displacement)
+    return translations
 
 
 def follow_connections(parts: tuple[EditablePart, ...], scales: dict, plan: ConnectionPlan) -> tuple[tuple[EditablePart, ...], dict[int, np.ndarray]]:
+    """One directed response, also used to compile the root-free UI network."""
     scales = validate_scales(parts, scales)
-    by_id = {part.part_id: part for part in parts}
-    by_connection = {item.connection_id: item for item in plan.connections}
+    translations = _directed_translations(parts, scales, plan)
+    edited = scale_parts(parts, scales)
+    return tuple(replace(part, vertices=part.vertices + translations[part.part_id]) for part in edited), translations
+
+
+def build_following_network(parts, connections, preferred_relations=()):
+    """Compile each part's influence on every other part, excluding itself.
+
+    Fixed rest-shape linear responses can be superposed. This makes consecutive
+    edits independent of slider order and avoids jumps when the edited part changes.
+    """
+    ids = sorted(part.part_id for part in parts if len(part.faces))
+    responses, cache = [], {}
+    for source in ids:
+        plan = build_connection_plan(parts, connections, source, preferred_relations, response_cache=cache)
+        unit_edit = {str(part.part_id): 2. if part.part_id == source else 1. for part in parts}
+        translations = _directed_translations(parts, unit_edit, plan)
+        for target in ids:
+            if source != target and np.any(translations[target] != 0):
+                responses.append({"source_id": source, "target_id": target,
+                                  "displacement": translations[target].tolist()})
+    return {"following_method": NETWORK_FOLLOW_METHOD, "driver_ids": ids, "responses": responses}
+
+
+def follow_connected_parts(parts, scales, network):
+    scales = validate_scales(parts, scales)
+    if network.get("following_method") != NETWORK_FOLLOW_METHOD:
+        raise ValueError("編集パーツからの追従データが不正です。")
     translations = {part.part_id: np.zeros(3) for part in parts}
-    for attachment in plan.attachments:
-        parent, child = by_id[attachment.parent_id], by_id[attachment.child_id]
-        anchor = by_connection[attachment.connection_id].anchor
-        # Compare displacements from the same original anchor. Reconstructing
-        # two absolute anchors can introduce a nonzero offset even at scale 1.
-        parent_delta = (scales[str(parent.part_id)] - 1) * (anchor - parent.center) + translations[parent.part_id]
-        child_delta = (scales[str(child.part_id)] - 1) * (anchor - child.center)
-        translations[child.part_id] = parent_delta - child_delta
+    for response in network["responses"]:
+        source, target = response["source_id"], response["target_id"]
+        if source == target or source not in translations or target not in translations:
+            raise ValueError("追従元と接続先のパーツが不正です。")
+        displacement = np.asarray(response["displacement"], dtype=float)
+        if displacement.shape != (3,) or not np.isfinite(displacement).all():
+            raise ValueError("接続先への変位データが不正です。")
+        translations[target] += (scales[str(source)] - 1) * displacement
     edited = scale_parts(parts, scales)
     return tuple(replace(part, vertices=part.vertices + translations[part.part_id]) for part in edited), translations
 
@@ -187,6 +249,26 @@ def connection_payload(plan: ConnectionPlan) -> dict:
                     "anchor": item.anchor.tolist(), "boundary_length": item.boundary_length, "edge_count": item.edge_count}
                    for item in plan.connections]
     by_id = {item["connection_id"]: item for item in connections}
-    return {"connections": connections, "roots": list(plan.roots), "unused_ids": list(plan.unused_ids),
+    return {"following_method": FOLLOW_METHOD, "connections": connections, "roots": list(plan.roots), "unused_ids": list(plan.unused_ids),
             "attachments": [{"parent_id": item.parent_id, "child_id": item.child_id, "connection_id": item.connection_id,
-                             "anchor": by_id[item.connection_id]["anchor"]} for item in plan.attachments]}
+                             "anchor": by_id[item.connection_id]["anchor"], "following_method": FOLLOW_METHOD,
+                             "planes": list(item.planes), "projection": item.projection.tolist(),
+                             "scale_displacement": item.scale_displacement.tolist()} for item in plan.attachments]}
+
+
+def following_diagnostics(parts, scales, plan, translations, compare_deformed_planes=False):
+    by_id = {part.part_id: part for part in parts}
+    rows = []
+    for attachment in plan.attachments:
+        parent = by_id[attachment.parent_id]
+        for plane in attachment.planes:
+            normal, origin = np.asarray(plane["normal"]), np.asarray(plane["origin"])
+            desired = (scales[str(parent.part_id)] - 1) * (origin - parent.center) + translations[parent.part_id]
+            actual = translations[attachment.child_id]
+            if compare_deformed_planes:
+                child = by_id[attachment.child_id]
+                actual = actual + (scales[str(child.part_id)] - 1) * (origin - child.center)
+            residual = abs(float(normal @ (actual - desired)))
+            rows.append({"parent_id": parent.part_id, "child_id": attachment.child_id,
+                         **plane, "normal_residual": residual})
+    return rows

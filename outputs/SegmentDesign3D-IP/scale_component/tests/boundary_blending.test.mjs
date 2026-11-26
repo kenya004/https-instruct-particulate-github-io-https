@@ -63,3 +63,23 @@ test('invalid source indices and inconsistent weights are rejected before drawin
   bad.anchors['0'][1].indices = [10];
   assert.throws(() => normalizeBlending(bad, parts), /頂点対応/);
 });
+
+test('editing-source blending keeps other-source motion and only attenuates its own scale', () => {
+  const spec = {application: 'edited_part', influences: [{reference_part_id: 7, weights: [1, .5, 0], scale_displacement: [.25, 0, 0]}]};
+  const transforms = affineTransforms(parts, scales, automatic);
+  assert.deepEqual(blendedPoint(parts[1], 0, transforms, spec), [12.25, 20, 30]);
+  assert.deepEqual(blendedPoint(parts[1], 1, transforms, spec), [13.125, 20, 30]);
+  assert.deepEqual(blendedPoint(parts[1], 2, transforms, spec), [15, 20, 30]);
+  const output = new Float32Array(9);
+  writeBlendedPositions(parts[1], transforms, spec, output);
+  assert.deepEqual([...output], [.25, 0, 0, 1.125, 0, 0, 3, 0, 0]);
+  const unedited = affineTransforms(parts, {...scales, '15': 1}, automatic);
+  assert.deepEqual(blendedPoint(parts[1], 0, unedited, spec), [12, 20, 30]);
+  const value = {application: 'edited_part', parts: {'15': spec}};
+  assert.equal(normalizeBlending(value, parts).parts['15'], spec);
+  for (const displacement of [undefined, [1, 2], [1, NaN, 3]]) {
+    const invalid = structuredClone(value);
+    invalid.parts['15'].influences[0].scale_displacement = displacement;
+    assert.throws(() => normalizeBlending(invalid, parts), /重み/);
+  }
+});

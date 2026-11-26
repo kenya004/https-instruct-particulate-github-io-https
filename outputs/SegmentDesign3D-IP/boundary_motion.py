@@ -6,11 +6,12 @@ from dataclasses import replace
 
 import numpy as np
 
-from boundary_blending import DISTANCE_BASIS, RANGE_BASIS, _SurfaceQueries, boundary_anchor_samples, boundary_geometry, reference_distance_field
+from boundary_blending import DISTANCE_BASIS, RANGE_BASIS, EDIT_APPLICATION, _SurfaceQueries, boundary_anchor_samples, boundary_geometry, reference_distance_field
 from editing import validate_offsets
 
 
 METHOD = "reference_surface_translation_v3"
+EDIT_METHOD = "edited_part_translation_v4"
 
 
 def build_motion_distances(content, manifest, parts, connections, selected_ids=None):
@@ -86,20 +87,22 @@ def apply_boundary_motion(parts, offsets, payload):
 
 
 def motion_from_blending(blending):
-    """Match translation to each connection's scale reference, including chains.
+    """Use the same band for scale and manual displacement.
 
-    A part can deform at one cut and be the reference at another. Its own
-    translation remains unrestricted at reference cuts; only the deforming
-    cut inherits the other side's translation.
+    Edited-source blending only attenuates the part's own displacement. Legacy
+    fixed-reference fields also inherit the selected reference's displacement.
     """
-    payload = {"method": METHOD, "distance_basis": DISTANCE_BASIS, "range_basis": RANGE_BASIS, "parts": {}, "anchors": blending["anchors"], "warnings": []}
+    own_edit = blending.get("application") == EDIT_APPLICATION
+    payload = {"method": EDIT_METHOD if own_edit else METHOD,
+               "application": EDIT_APPLICATION if own_edit else "fixed_reference",
+               "distance_basis": DISTANCE_BASIS, "range_basis": RANGE_BASIS, "parts": {}, "anchors": blending["anchors"], "warnings": []}
     for part_id, field in blending["parts"].items():
         influences = field["influences"]
         if not influences:
             continue
         weights = np.clip(1 - np.sum([r["weights"] for r in influences], axis=0), 0, 1)
         payload["parts"][part_id] = {"part_id": field["part_id"], "ratio": blending["ratio"],
-            "weights": weights.tolist(), "reference_influences": influences,
+            "weights": weights.tolist(), "reference_influences": [] if own_edit else influences,
             "depth": field["depth"], "radius": field["radius"], "part_size": field["part_size"],
             "boundary_vertices": int(np.count_nonzero(weights == 0)),
             "transition_vertices": int(np.count_nonzero((weights > 0) & (weights < 1))),
@@ -108,6 +111,7 @@ def motion_from_blending(blending):
 
 
 def motion_metadata(payload):
-    return {"method": payload["method"], "distance_basis": payload["distance_basis"], "range_basis": payload["range_basis"], "selected_ids": sorted(int(key) for key in payload["parts"]),
+    return {"method": payload["method"], "application": payload.get("application", "fixed_reference"),
+            "distance_basis": payload["distance_basis"], "range_basis": payload["range_basis"], "selected_ids": sorted(int(key) for key in payload["parts"]),
             "parts": {key: {name: value for name, value in spec.items() if name not in {"weights", "reference_influences"}}
                       for key, spec in payload["parts"].items()}}

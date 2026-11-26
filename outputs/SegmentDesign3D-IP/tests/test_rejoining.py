@@ -188,7 +188,7 @@ class RejoiningInterfaceTests(unittest.TestCase):
         with patch.object(BackendClient, "segment", return_value=manifest), patch.object(BackendClient, "download_artifact", side_effect=lambda result, name: artifacts[name]):
             app.button(key="segment").click().run()
         source = app.session_state["part_editing"]["source_key"]
-        app.selectbox(key=f"connection_root_{source}").set_value(1).run()
+        app.selectbox(key=f"assembly_reference_{source}").set_value(1).run()
         event = {"source_key": source, "sequence": 1, "scales": {"0": 1, "1": 2, "2": 1}}
         with patch("part_editor._component", return_value=event):
             app.run()

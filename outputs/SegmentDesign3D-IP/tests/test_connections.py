@@ -12,7 +12,7 @@ import trimesh
 from streamlit.testing.v1 import AppTest
 
 from backend_client import BackendClient
-from connections import Connection, build_connection_plan, connection_payload, connection_residuals, detect_connections, follow_connections
+from connections import Connection, build_connection_plan, connection_payload, connection_residuals, detect_connections, follow_connections, following_diagnostics
 from editing import export_edited_glb, load_editable_parts
 from test_preparation import part_plan
 
@@ -96,7 +96,9 @@ class ConnectionTests(unittest.TestCase):
             plan = build_connection_plan(self.parts, self.connections, root)
             edited, offsets = follow_connections(self.parts, scales, plan)
             np.testing.assert_allclose(edited[root].center, self.parts[root].center)
-            self.assertLess(max(connection_residuals(self.parts, scales, self.connections, offsets).values()), 1e-12)
+            self.assertTrue(all(row["normal_residual"] < 1e-12 for row in following_diagnostics(self.parts, scales, plan, offsets)))
+            for part, original in zip(edited, self.parts):
+                np.testing.assert_allclose(part.center, original.center + offsets[part.part_id])
         restored, offsets = follow_connections(self.parts, {"0": 1, "1": 1, "2": 1}, plan)
         for original, part in zip(self.parts, restored):
             np.testing.assert_array_equal(part.vertices, original.vertices)
@@ -111,7 +113,7 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(len(connections), 2)
         np.testing.assert_allclose([item.anchor for item in connections], [[11, 20, 30], [12, 20, 30]])
 
-    def test_two_separate_boundaries_are_not_averaged_and_extra_constraint_is_reported(self):
+    def test_two_separate_boundaries_share_a_plane_without_tangential_following(self):
         vertices, faces, labels = prism_geometry(2)
         other = vertices + [0, 4, 0]
         manifest, artifacts = connection_fixture(geometry=(np.vstack([vertices, other]), np.vstack([faces, faces + len(vertices)]), np.tile(labels, 2)))
@@ -120,11 +122,14 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(len(connections), 2)
         self.assertEqual(sorted(item.anchor[1] for item in connections), [20, 24])
         plan = build_connection_plan(parts, connections, 0)
-        self.assertEqual(len(plan.unused_ids), 1)
+        self.assertEqual(plan.unused_ids, ())
+        self.assertEqual(len(plan.attachments[0].planes), 1)
+        self.assertEqual(plan.attachments[0].planes[0]["connection_ids"], [0, 1])
         _, offsets = follow_connections(parts, {"0": 2, "1": 1}, plan)
+        np.testing.assert_allclose(offsets[1], [.5, 0, 0])
         residuals = connection_residuals(parts, {"0": 2, "1": 1}, connections, offsets)
-        self.assertAlmostEqual(residuals[plan.attachments[0].connection_id], 0)
-        self.assertGreater(residuals[plan.unused_ids[0]], 1)
+        self.assertTrue(all(value > 1 for value in residuals.values()))
+        self.assertTrue(all(row["normal_residual"] < 1e-12 for row in following_diagnostics(parts, {"0":2,"1":1}, plan, offsets)))
 
     def test_boundary_center_uses_length_not_vertex_count(self):
         # Subdivide one side of the connection ring unequally; the center stays the same.
@@ -196,7 +201,7 @@ class ConnectionTests(unittest.TestCase):
 
 
 class ConnectionInterfaceTests(unittest.TestCase):
-    def test_root_change_and_follow_toggle_update_python_mesh_without_segmentation(self):
+    def test_follow_toggle_updates_mesh_and_assembly_reference_does_not_choose_the_driver(self):
         manifest, artifacts = connection_fixture()
         path = Path(__file__).resolve().parents[1] / "app.py"
         app = AppTest.from_file(str(path)).run()
@@ -209,7 +214,8 @@ class ConnectionInterfaceTests(unittest.TestCase):
             app.button(key="segment").click().run()
         self.assertEqual(len(app.exception), 0)
         source = app.session_state["part_editing"]["source_key"]
-        app.selectbox(key=f"connection_root_{source}").set_value(1).run()
+        self.assertFalse(any(item.key==f'connection_root_{source}' for item in app.selectbox))
+        app.selectbox(key=f"assembly_reference_{source}").set_value(1).run()
         event = {"source_key": source, "sequence": 1, "scales": {"0": 1, "1": 2, "2": 1}}
         with patch("part_editor._component", return_value=event):
             app.run()
@@ -223,10 +229,11 @@ class ConnectionInterfaceTests(unittest.TestCase):
         np.testing.assert_allclose(state["edited_parts"][0].center, [10.5, 20, 30])
         self.assertFalse(state["connections"]["enabled"])
         app.checkbox(key=f"connection_follow_{source}").set_value(True).run()
-        app.selectbox(key=f"connection_root_{source}").set_value(0).run()
+        app.selectbox(key=f"assembly_reference_{source}").set_value(0).run()
         state = app.session_state["part_editing"]
-        np.testing.assert_allclose(state["edited_parts"][0].center, [10.5, 20, 30])
-        np.testing.assert_allclose(state["edited_parts"][2].center, [13.5, 20, 30])
+        np.testing.assert_allclose(state["edited_parts"][0].center, [10, 20, 30])
+        np.testing.assert_allclose(state["edited_parts"][1].center, [11.5, 20, 30])
+        np.testing.assert_allclose(state["edited_parts"][2].center, [13, 20, 30])
         self.assertEqual(len(app.exception), 0)
 
 

@@ -7,8 +7,9 @@ import numpy as np
 from streamlit.components.v1 import declare_component
 
 from editing import editor_payload, editor_source_key, export_edited_glb, load_editable_parts, scale_parts, synchronize_editor, translation_controls
-from connections import build_connection_plan, connection_payload, connection_residuals, detect_connections, follow_connections
-from boundary_blending import DEFAULT_RATIO, METHOD as BLEND_METHOD, apply_boundary_blend, blend_metadata, blended_anchor_residuals, build_blend_distances, blend_weights
+from connections import build_connection_plan, build_following_network, connection_payload, connection_residuals, detect_connections, follow_connected_parts, following_diagnostics
+from connection_planes import NETWORK_FOLLOW_METHOD, GEOMETRY_VERSION
+from boundary_blending import DEFAULT_RATIO, EDIT_METHOD as BLEND_METHOD, apply_boundary_blend, blend_metadata, blended_anchor_residuals, build_blend_distances, build_edit_blend_distances, blend_weights, edit_blend_responses
 from boundary_motion import METHOD as MOTION_METHOD, apply_boundary_motion, build_motion_distances, motion_metadata, motion_weights, motion_from_blending
 from movement_axes import build_movement_frames
 from mesh_overlaps import METHOD as OVERLAP_METHOD, assemble_parts, find_face_overlaps, only_new_overlaps, overlap_frame, part_face_ids
@@ -25,18 +26,27 @@ _component = declare_component(f"part_scale_editor_{_component_version}", path=s
 
 
 @st.cache_data(show_spinner=False)
-def _load(content: bytes, manifest: dict, topology_version=2):
-    # Version the cache because connections now also retain their source edges.
+def _load(content: bytes, manifest: dict, topology_version=GEOMETRY_VERSION):
+    # Version the cache because connections now also retain their contact planes.
     parts = load_editable_parts(content, manifest)
     connections, warnings = detect_connections(content, parts)
     return parts, connections, warnings, has_rejoin_data(content, manifest)
 
 
 @st.cache_data(show_spinner=False, max_entries=6)
+def _load_following_network(content, manifest, preferred_pairs=(), method=NETWORK_FOLLOW_METHOD):
+    parts, connections, _, _ = _load(content, manifest, GEOMETRY_VERSION)
+    relations = [{"parent_id": a, "child_id": b} for a, b in preferred_pairs]
+    return build_following_network(parts, connections, relations)
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
 def _load_blend_distances(content, manifest, selected_ids, root_id, connection_ids=None, references=(), range_method=BLEND_METHOD):
-    parts, connections, _, _ = _load(content, manifest, 2)
+    parts, connections, _, _ = _load(content, manifest, GEOMETRY_VERSION)
     if connection_ids is not None:
         connections = tuple(c for c in connections if c.connection_id in connection_ids)
+    if range_method == BLEND_METHOD:
+        return build_edit_blend_distances(content, manifest, parts, connections, selected_ids)
     return build_blend_distances(content, manifest, parts, connections, selected_ids, root_id, dict(references))
 
 
@@ -48,13 +58,13 @@ def _load_blending(content, manifest, selected_ids, ratio, root_id, connection_i
 
 @st.cache_data(show_spinner=False, max_entries=12)
 def _load_frames(content, manifest, up_dir, selected, enabled):
-    parts, connections, _, _ = _load(content, manifest, 2)
+    parts, connections, _, _ = _load(content, manifest, GEOMETRY_VERSION)
     return build_movement_frames(content, parts, connections, up_dir, dict(selected), enabled=enabled)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def _load_motion_distances(content, manifest, connection_ids=None, range_method=MOTION_METHOD, selected_ids=None):
-    parts, connections, _, _ = _load(content, manifest, 2)
+    parts, connections, _, _ = _load(content, manifest, GEOMETRY_VERSION)
     if connection_ids is not None:
         connections = tuple(c for c in connections if c.connection_id in connection_ids)
     return build_motion_distances(content, manifest, parts, connections, selected_ids)
@@ -82,7 +92,7 @@ def _overlaps(vertices, faces, frame=None):
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def _reference_overlaps(content, manifest, method):
-    parts, _, _, can_rejoin = _load(content, manifest, 2)
+    parts, _, _, can_rejoin = _load(content, manifest, GEOMETRY_VERSION)
     vertices, faces, _ = assemble_parts(parts)
     report = _overlaps(vertices, faces)
     source_face_ids = None
@@ -97,7 +107,7 @@ def _reference_overlaps(content, manifest, method):
 
 
 def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None) -> None:
-    parts, connections, warnings, can_rejoin = _load(content, result, 2)
+    parts, connections, warnings, can_rejoin = _load(content, result, GEOMETRY_VERSION)
     source_key = editor_source_key(result, content)
     state = st.session_state.setdefault("part_editing", {})
     synchronize_editor(state, source_key, parts)
@@ -105,23 +115,31 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
     names = {part.part_id: part.name for part in parts}
     policy = render_policy(result, analysis, parts, connections, source_key)
     auto_selected, blend_references, blend_ids = connection_settings(policy, connections)
-    root_id = st.selectbox("基準パーツ（拡大縮小の位置を固定）", available,
-                           format_func=lambda index: f"{names[index]} (ID {index})", key=f"connection_root_{source_key}")
+    # This reference is only for closure/extension roles, not following or blending.
+    root_id = policy["base_part_id"] if policy and policy["base_part_id"] in available else available[0]
+    preferred_pairs = tuple(sorted((r["parent_id"], r["child_id"]) for r in policy["relations"])) if policy else ()
     with st.expander("詳細な形状編集設定"):
-        follow = st.checkbox("接続位置に追従", value=True, disabled=not connections, key=f"connection_follow_{source_key}")
+        if policy is None:
+            root_id = st.selectbox("閉鎖・延長の本体（手動構成）", available,
+                format_func=lambda index: f"{names[index]} (ID {index})", key=f"assembly_reference_{source_key}")
+        follow = st.checkbox("編集したパーツから接続先へ追従", value=True, disabled=not connections, key=f"connection_follow_{source_key}")
         show_anchors = st.checkbox("接続点を表示", value=True, disabled=not connections, key=f"connection_points_{source_key}")
         plan = build_connection_plan(parts, connections, root_id, preferred_relations=policy["relations"] if policy else ())
-        layout = connection_payload(plan)
+        network = _load_following_network(content, result, preferred_pairs, NETWORK_FOLLOW_METHOD)
+        layout = {**connection_payload(plan), **network}
         for warning in warnings:
             st.warning(warning)
+        for attachment in plan.attachments:
+            for warning in attachment.warnings:
+                st.warning(f"{names[attachment.parent_id]} / {names[attachment.child_id]}: {warning}")
         if connections:
-            st.caption(f"接続領域：{len(connections)} / 追従に使用：{len(plan.attachments) if follow else 0}。緑の点は位置の一致、橙の点と線はずれを表します。")
-            st.caption("拡大縮小に伴う接続位置へ追従します。なじませる接続は、移動時も基準側へ境界を合わせます。" if policy else
-                "拡大縮小に伴う接続位置へ追従します。移動操作で境界を残す場合は、下の移動方法から断面固定移動を選んでください。")
+            plane_count = sum(len(a.planes) for a in plan.attachments)
+            st.caption(f"接続領域：{len(connections)} / 追従の基準面：{plane_count if follow else 0}。丸印と線は断面中心のずれを表示します。方向追従では中心の一致を拘束しません。")
+            st.caption("倍率を変えたパーツから、つながる別パーツへ法線方向の変位を伝えます。固定した追従の基準はありません。自分の倍率変更では自分を平行移動させず、複数の倍率変更は合成します。")
             if plan.unused_ids:
-                st.warning("輪状の接続または同じパーツ間の複数接続があります。平行移動の追従には境界の長い接続を優先します。なじませは指定されたすべての接続境界に適用します。")
+                st.warning("輪状の接続、または平面を取得できない接続が残っています。検出した接続関係で追従に使う領域を確認してください。")
             if len(plan.roots) > 1:
-                st.caption("基準パーツにつながらないグループは、それぞれID最小の非空パーツの位置を固定します。")
+                st.caption("離れたグループの間では、追従を伝えません。")
         elif len(available) > 1:
             st.info("共有境界を検出できませんでした。離れたメッシュや頂点位置の異なる境界には、自動で接続を作りません。")
         connected_ids = {index for item in connections for index in (item.part_a, item.part_b)}
@@ -130,18 +148,19 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
                                      format_func=lambda index: f"{names[index]} (ID {index})", key=f"boundary_blend_parts_{source_key}")
         else:
             selected = list(auto_selected)
-            st.caption("なじませの自動対象：" + (", ".join(names[i] for i in selected) or "なし"))
+            st.caption("編集時になじませるパーツ：" + (", ".join(names[i] for i in selected) or "なし"))
         percent = st.slider("境界なじませの範囲（%）", 1, 100, int(DEFAULT_RATIO * 100), disabled=not selected, key=f"boundary_blend_range_{source_key}")
-        st.caption("断面を接続先に合わせ、本体の表面から離れるほど指定倍率を適用します。距離は編集前の接続先の三角形表面まで測り、一度計算して再利用します。幅は元のパーツを囲むBoxの最長辺に対する割合で、初期値60%です。")
+        st.caption("編集したパーツ自身の変形量を境界付近で調整し、追従後の接続先に合わせます。両方の編集は合成します。距離と重みは元の形状から計算して再利用し、幅は元のパーツのBoxの最長辺に対する割合（初期値60%）です。")
         with st.spinner("接続先の表面までの距離と重みを準備しています"):
-            blending = _load_blending(content, result, tuple(sorted(selected)), percent / 100, root_id,
+            blending = _load_blending(content, result, tuple(sorted(selected)), percent / 100, None,
                 blend_ids if policy else None, blend_references, BLEND_METHOD)
+        blending = edit_blend_responses(blending, network, follow=bool(follow and connections))
         for warning in blending["warnings"]:
             st.warning(warning)
         motion_ratios = {}
         if policy:
             motion_ratios = {part_id: percent / 100 for part_id in selected}
-            st.caption("なじませる接続では、倍率と同じ遷移範囲で移動量も調整します。閉鎖して再結合する断面は自由に移動します。")
+            st.caption("なじませる接続では、移動したパーツ自身の移動量も境界で0へなじませます。閉鎖して再結合する断面は自由に移動します。")
         else:
             with st.expander("パーツごとの移動方法"):
                 for part in parts:
@@ -181,14 +200,14 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
         movement = {name: value * .2 for name, value in movement.items()}
         st.caption(f"全体移動はパーツ全体を動かし、断面固定移動は操作前の境界を固定します。軸の矢印は赤＝U、緑＝V、青＝N。断面がないパーツは入力XYZです。入力座標の単位で各軸 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
     if follow and connections:
-        edited, automatic = follow_connections(parts, state["scales"], plan)
+        edited, automatic = follow_connected_parts(parts, state["scales"], network)
     else:
         edited = scale_parts(parts, state["scales"])
         automatic = {part.part_id: np.zeros(3) for part in parts}
     uniform_parts = edited
     edited = apply_boundary_blend(parts, edited, state["scales"], automatic, blending)
     baseline = edited
-    # Manual offsets are applied after the whole attachment tree is solved; they never propagate.
+    # Manual offsets are applied after automatic following; they never propagate.
     edited = apply_boundary_motion(edited, state["offsets"], motion)
     # Both boundary blending and boundary-fixed movement can create local
     # deformation. Only exact uniform poses may skip internal overlap checks.
@@ -206,6 +225,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
                 "manual_translations": state["offsets"],
                 "translations": {str(index): value.tolist() for index, value in translations.items()},
                 "anchor_residuals": {str(index): value for index, value in residuals.items()},
+                "following_planes": following_diagnostics(parts, state["scales"], plan, automatic, compare_deformed_planes=True) if follow else [],
                 "boundary_blending": blend_info, "movement_frames": frames, "boundary_motion": motion_metadata(motion)}
     if policy:
         metadata["editing_policy"] = {**policy, "base_part_id": root_id}
@@ -241,15 +261,15 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
         st.info("断面固定移動を選んでいるパーツがあります。断面を動かして延長を確認する場合は「詳細な形状編集設定 → パーツごとの移動方法」で全体移動を選んでください。")
     event = _component(
         source_key=source_key, parts=editor_payload(parts), scales=state["scales"],
-        editor_protocol=8, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
+        editor_protocol=11, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
         solid_connections=solid_payload,
-        boundary_motion=motion, motion_key=repr((MOTION_METHOD, sorted(motion_ratios.items()), blend_ids, blend_references)),
+        boundary_motion=motion, motion_key=repr((motion["method"], sorted(motion_ratios.items()), blend_ids)),
         movement_key=f"{frame_mode}:{sorted(choices.items())}",
-        blending_key=f"{BLEND_METHOD}:{root_id}:{sorted(selected)}:{percent}:{blend_references}",
+        blending_key=f"{BLEND_METHOD}:{sorted(selected)}:{percent}:{blend_ids}:{bool(follow)}",
         offsets=state["offsets"], movement=movement, show_overlaps=show_overlaps, overlap_faces=overlap_faces,
         overlap_status=(f"新しく重なるFace：{len(overlap_report['face_ids'])}面 / {overlap_report['pair_count']}組" if overlap_report else "重なり表示はオフです"),
         layout=layout, follow=bool(follow and connections), show_anchors=bool(show_anchors and connections),
-        layout_key=f"{root_id}:{bool(follow)}:{bool(show_anchors)}",
+        layout_key=f"{NETWORK_FOLLOW_METHOD}:{preferred_pairs}:{bool(follow)}:{bool(show_anchors)}",
         sequence=state["sequence"], up_dir=up_dir, default=None, key=f"part_scale_move_{source_key}",
     )
     synchronize_editor(state, source_key, parts, event, movement_frames=frames)
@@ -258,10 +278,17 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
         st.rerun()
     if connections:
         with st.expander("検出した接続関係"):
-            used = {item.connection_id for item in plan.attachments}
+            used = {index for item in plan.attachments for plane in item.planes for index in plane["connection_ids"]}
             st.dataframe([{"接続ID": item.connection_id, "パーツA": names[item.part_a], "パーツB": names[item.part_b],
                            "追従に使用": bool(follow and item.connection_id in used), "接続点のずれ（入力座標単位）": residuals[item.connection_id]}
                           for item in connections], hide_index=True, width="stretch")
+            if metadata["following_planes"]:
+                st.dataframe([{"パーツA": names[row["parent_id"]], "パーツB": names[row["child_id"]],
+                    "まとめた接続ID": ", ".join(map(str, row["connection_ids"])),
+                    "法線X": row["normal"][0], "法線Y": row["normal"][1], "法線Z": row["normal"][2],
+                    "法線方向の残差": row["normal_residual"]} for row in metadata["following_planes"]], hide_index=True, width="stretch")
+                if any(row["normal_residual"] > movement["limit"] * 1e-7 for row in metadata["following_planes"]):
+                    st.warning("一つの平行移動では複数の接続面を合わせられないため、法線方向のずれが残っています。なじませ・延長・結合の結果を確認してください。")
     st.download_button(
         "編集後 GLB", export_edited_glb(edited, source_key=source_key, scales=state["scales"], connection_metadata=metadata, offsets=state["offsets"]),
         file_name=f"{result['segmentation_id']}_scaled.glb", mime="model/gltf-binary", icon=":material/download:", key="download_edited_glb",

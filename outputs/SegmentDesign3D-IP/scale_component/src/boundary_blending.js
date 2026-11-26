@@ -14,6 +14,13 @@ export function blendedPoint(part, index, transforms, spec) {
   for (const influence of spec?.influences ?? []) {
     const weight = influence.weights[index];
     if (!weight) continue;
+    if (spec.application === 'edited_part') {
+      for (let axis = 0; axis < 3; axis += 1) {
+        result[axis] += weight * (own.scale - 1)
+          * (influence.scale_displacement[axis] - (point[axis] - part.center[axis]));
+      }
+      continue;
+    }
     const reference = transforms[String(influence.reference_part_id)];
     for (let axis = 0; axis < 3; axis += 1) {
       result[axis] += weight * (reference.scale * point[axis] + reference.shift[axis] - baseline[axis]);
@@ -31,8 +38,13 @@ export function writeBlendedPositions(part, transforms, spec, output, offset = [
       const baseline = own.scale * point[axis] + own.shift[axis];
       let value = baseline;
       for (const influence of spec.influences) {
-        const reference = transforms[String(influence.reference_part_id)];
-        value += influence.weights[index] * (reference.scale * point[axis] + reference.shift[axis] - baseline);
+        if (spec.application === 'edited_part') {
+          value += influence.weights[index] * (own.scale - 1)
+            * (influence.scale_displacement[axis] - (point[axis] - part.center[axis]));
+        } else {
+          const reference = transforms[String(influence.reference_part_id)];
+          value += influence.weights[index] * (reference.scale * point[axis] + reference.shift[axis] - baseline);
+        }
       }
       output[index * 3 + axis] = value + (motion?.weights[index] ?? 1) * offset[axis] - part.center[axis];
       for (const reference of motion?.reference_influences ?? []) {
@@ -65,11 +77,16 @@ export function normalizeBlending(value, parts) {
   for (const [id, spec] of Object.entries(specs)) {
     const part = byId.get(Number(id));
     if (!part?.center || !Array.isArray(spec?.influences)) fail();
+    if (spec.application != null && spec.application !== 'edited_part') fail();
+    if (value.application === 'edited_part' && spec.application !== 'edited_part') fail();
     const sums = new Float64Array(part.vertices.length);
     const references = new Set();
     for (const influence of spec.influences) {
       if (!byId.get(influence.reference_part_id)?.center || references.has(influence.reference_part_id)
           || !Array.isArray(influence.weights) || influence.weights.length !== part.vertices.length) fail();
+      if (spec.application === 'edited_part' && (influence.reference_part_id === part.part_id
+          || !Array.isArray(influence.scale_displacement) || influence.scale_displacement.length !== 3
+          || !influence.scale_displacement.every(v => typeof v === 'number' && Number.isFinite(v)))) fail();
       references.add(influence.reference_part_id);
       for (const [index, weight] of influence.weights.entries()) {
         if (typeof weight !== "number" || !Number.isFinite(weight) || weight < 0 || weight > 1) fail();

@@ -216,7 +216,11 @@ class BoundaryBlendingInterfaceTests(unittest.TestCase):
         self.assertEqual(state["connections"]["boundary_blending"]["selected_ids"], [1])
         self.assertAlmostEqual(state["connections"]["boundary_blending"]["ratio"], .6)
         seam = np.isclose(parts[1].vertices[:, 0], 11)
-        np.testing.assert_allclose(state["edited_parts"][1].vertices[seam], parts[1].vertices[seam])
+        # The scaled section drives its neighbor; blending follows that moved
+        # neighbor rather than holding the seam in the original world position.
+        neighbor_shift = state["connections"]["automatic_translations"]["0"]
+        np.testing.assert_allclose(neighbor_shift, [-5, 0, 0])
+        np.testing.assert_allclose(state["edited_parts"][1].vertices[seam], parts[1].vertices[seam] + neighbor_shift)
         app.button(key="rejoin_mesh").click().run()
         self.assertIn("rejoined", app.session_state["part_editing"])
         app.slider(key=range_key).set_value(40).run()

@@ -195,7 +195,7 @@ function updateConnectionPreview(result) {
 }
 
 function updatePreview() {
-  const automatic = solveTranslations(partData, scales, following ? layout.attachments : []);
+  const automatic = solveTranslations(partData, scales, following ? layout : []);
   const translations = Object.fromEntries(partData.map(part => {
     const id = String(part.part_id);
     return [id, automatic[id].map((value, axis) => value + offsets[id][axis])];

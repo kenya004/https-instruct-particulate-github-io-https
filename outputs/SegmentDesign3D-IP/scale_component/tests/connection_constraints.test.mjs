@@ -189,7 +189,8 @@ test('scaling reports invalid connections without silently changing scales or of
 test('original vertices use the same following, blending and boundary motion as the body preview', () => {
   const args = supportFixture();
   args.follow = true;
-  args.layout.attachments = [{ parent_id: 0, child_id: 1, anchor: [.2, -.3, 0] }];
+  args.layout.attachments = [{ parent_id: 0, child_id: 1, anchor: [.2, -.3, 0], following_method:'reference_plane_normal_v1',
+    projection:[[0,0,0],[0,0,0],[0,0,1]],scale_displacement:[0,0,-.5] }];
   args.scales = { '0': 1.1, '1': 1.2 };
   args.offsets = { '0': [.1, .2, .3], '1': [.3, -.1, .2] };
   args.blending.parts['1'] = { influences: [{ reference_part_id: 0, weights: [.2, .3, .4, .1, 0, 0, 0, 0] }] };

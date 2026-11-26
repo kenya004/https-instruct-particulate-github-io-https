@@ -6,30 +6,7 @@ import io
 import numpy as np
 
 from orientation import source_to_display
-
-
-def boundary_plane(segments):
-    """Fit a plane to uniform arc length, independent of edge subdivision."""
-    segments = np.asarray(segments, dtype=float)
-    lengths = np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1)
-    valid = lengths > 0
-    segments, lengths = segments[valid], lengths[valid]
-    if not len(lengths):
-        raise ValueError("境界に長さのある辺がありません。")
-    weights = lengths / lengths.sum()
-    center = np.sum(segments.mean(axis=1) * weights[:, None], axis=0)
-    a, b = (segments - center).transpose(1, 0, 2)
-    # Exact second moment of each line segment, rather than sampling vertices.
-    covariance = (
-        np.einsum("i,ij,ik->jk", weights, a, a) / 3
-        + np.einsum("i,ij,ik->jk", weights, b, b) / 3
-        + np.einsum("i,ij,ik->jk", weights, a, b) / 6
-        + np.einsum("i,ij,ik->jk", weights, b, a) / 6
-    )
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    if eigenvalues[1] <= max(eigenvalues[2], np.finfo(float).tiny) * 1e-10:
-        raise ValueError("境界が点または直線に近いため、平面を決められません。")
-    return center, eigenvectors[:, 0], float(np.sqrt(max(eigenvalues[0], 0))), float(np.sqrt(max(eigenvalues.sum(), 0)))
+from connection_planes import boundary_plane
 
 
 def build_movement_frames(content, parts, connections, up_dir, selected=None, *, enabled=True):

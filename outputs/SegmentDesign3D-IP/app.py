@@ -19,9 +19,9 @@ if not hasattr(backend_client.BackendClient, "refine_boundary") or getattr(backe
     importlib.reload(backend_client)
 if getattr(editing, "EDITING_PROTOCOL", 0) < 2:
     importlib.reload(editing)
-if "boundary_edges" not in connections.Connection.__dataclass_fields__:
+if "plane_normal" not in connections.Connection.__dataclass_fields__:
     importlib.reload(connections)
-refresh_ui_modules(names=("connections", "workflow", "orientation", "movement_axes", "boundary_blending", "boundary_motion", "rejoining", "mesh_overlaps", "viewer", "capping", "capping_panel", "connection_overlap", "boolean_union", "editing_policy", "solid_panel", "part_editor"))
+refresh_ui_modules(names=("connection_planes", "orientation", "movement_axes", "connections", "workflow", "boundary_blending", "boundary_motion", "rejoining", "mesh_overlaps", "viewer", "capping", "capping_panel", "connection_overlap", "boolean_union", "editing_policy", "solid_panel", "part_editor"))
 
 from backend_client import BackendClient, BackendError
 from orientation import aligned_mesh_payloads

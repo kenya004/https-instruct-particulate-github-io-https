@@ -39,7 +39,8 @@ def policy_for(manifest, analysis=None):
 def policy_rows(policy, names):
     return [{"本体側": names[r["parent_id"]], "付属・連続領域": names[r["child_id"]],
              "方式": "なじませ" if r["mode"] == "blend" else "閉鎖して再結合",
-             "基準側": names[r["reference_part_id"]], "変形側": names[r["deform_part_id"]],
+             "基準側": "接続先" if r["mode"] == "blend" else names[r["reference_part_id"]],
+             "変形側": "編集したパーツ" if r["mode"] == "blend" else names[r["deform_part_id"]],
              "判定理由": r["reason"]} for r in policy["relations"]]
 
 
@@ -54,10 +55,7 @@ def render_policy(manifest, analysis, parts, connections, source_key):
     names = {p.part_id: p.name for p in parts}
     available = {p.part_id for p in parts if len(p.faces)}
     root = prediction["base_part_id"]
-    root_key = f"connection_root_{source_key}"
-    if root in available and root_key not in st.session_state:
-        st.session_state[root_key] = root
-    elif root not in available:
+    if root not in available:
         st.warning(f"推定された本体 {names[root]} に面がないため、基準側を確認してください。")
     expected = {frozenset((r["parent_id"], r["child_id"])): r for r in prediction["relations"]}
     actual = {frozenset((c.part_a, c.part_b)) for c in connections}
@@ -79,10 +77,15 @@ def render_policy(manifest, analysis, parts, connections, source_key):
             mode = st.selectbox(f"{names[a]} / {names[b]} の接続方式", ["blend", "cap_union"],
                 index=["blend", "cap_union"].index(original["mode"]),
                 format_func=lambda m: "なじませ" if m == "blend" else "閉鎖して再結合", key=prefix + "_mode")
-            reference = st.selectbox(f"{names[a]} / {names[b]} の基準側", [a, b],
-                index=[a, b].index(original["reference_part_id"]), format_func=names.__getitem__, key=prefix + "_reference")
+            reference = original["reference_part_id"]
+            if mode == "blend":
+                st.caption("なじませは編集したパーツに適用します。両方の編集は合成し、固定の基準側は使いません。")
+            else:
+                reference = st.selectbox(f"{names[a]} / {names[b]} の基準側", [a, b],
+                    index=[a, b].index(original["reference_part_id"]), format_func=names.__getitem__, key=prefix + "_reference")
             relations.append({**original, "mode": mode,
                 "relationship": "continuous" if mode == "blend" else "attachment",
+                "blend_application": "edited_part" if mode == "blend" else None,
                 "reference_part_id": reference, "deform_part_id": b if reference == a else a})
         runtime = {**prediction, "relations": relations}
         if relations:
@@ -98,6 +101,6 @@ def connection_settings(policy, connections):
     for c in connections:
         r = by_pair.get(frozenset((c.part_a, c.part_b)))
         if r and r["mode"] == "blend":
-            selected.add(r["deform_part_id"])
-            references.append((c.connection_id, r["reference_part_id"]))
-    return tuple(sorted(selected)), tuple(sorted(references)), tuple(i for i, _ in sorted(references))
+            selected.update((c.part_a, c.part_b))
+            references.append(c.connection_id)
+    return tuple(sorted(selected)), (), tuple(sorted(references))

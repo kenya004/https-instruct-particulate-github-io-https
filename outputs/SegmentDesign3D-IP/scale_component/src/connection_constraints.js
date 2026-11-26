@@ -292,7 +292,7 @@ function makeState(payload, parts) {
 }
 
 function deform(state, args, scales, offsets) {
-  const automatic = solveTranslations(args.parts, scales, args.follow ? args.layout?.attachments ?? [] : []);
+  const automatic = solveTranslations(args.parts, scales, args.follow ? args.layout : []);
   const transforms = affineTransforms(args.parts, scales, automatic);
   for (const [id, entry] of state.entries) {
     const { source, spec, positions, local } = entry;

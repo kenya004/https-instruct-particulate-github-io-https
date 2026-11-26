@@ -54,7 +54,8 @@ class AutoEditingPolicyTests(unittest.TestCase):
 
     def test_attachment_automatically_uses_body_even_when_handle_is_first(self):
         app,key,_,_=self.start(attachment=True)
-        self.assertEqual(app.selectbox(key=f'connection_root_{key}').value,1)
+        self.assertFalse(any(item.key==f'connection_root_{key}' for item in app.selectbox))
+        self.assertEqual(app.session_state['part_editing']['connections']['editing_policy']['base_part_id'],1)
         state=app.session_state['part_editing']
         self.assertEqual(state['connections']['boundary_blending']['selected_ids'],[])
         app.button(key='solid_close_parts').click().run()
@@ -70,7 +71,8 @@ class AutoEditingPolicyTests(unittest.TestCase):
         app,key,_,_=self.start()
         self.assertFalse(any(b.key=='solid_close_parts' for b in app.button))
         state=self.move(app,key,{'0':[.1,0,0],'1':[0,0,0],'2':[0,0,0]}, {'0':1.2,'1':1.,'2':1.})
-        self.assertEqual(state['connections']['boundary_blending']['selected_ids'],[0,2])
+        self.assertEqual(state['connections']['boundary_blending']['selected_ids'],[0,1,2])
+        self.assertEqual(state['connections']['boundary_blending']['active_scale_ids'],[0])
         self.assertEqual(state['connections']['anchor_residuals']['0'],0)
         app.button(key='blend_join').click().run()
         joined=app.session_state['part_editing']['blend_joined']['result']
@@ -81,7 +83,7 @@ class AutoEditingPolicyTests(unittest.TestCase):
 
     def test_mixed_connections_blend_one_cut_and_extend_the_other(self):
         app,key,_,_=self.start(mixed=True)
-        self.assertEqual(app.session_state['part_editing']['connections']['boundary_blending']['selected_ids'],[0])
+        self.assertEqual(app.session_state['part_editing']['connections']['boundary_blending']['selected_ids'],[0,1])
         app.button(key='solid_close_parts').click().run()
         self.move(app,key,{'0':[.1,0,0],'1':[0,0,0],'2':[.3,0,0]})
         app.button(key='solid_extend_parts').click().run()
@@ -96,7 +98,7 @@ class AutoEditingPolicyTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertFalse(app.error)
         self.assertIn('solid_union', app.session_state['part_editing'])
-    def test_reference_translation_keeps_the_blended_boundary_coincident(self):
+    def test_middle_part_translation_fades_to_both_shared_boundaries(self):
         app,key,_,_=self.start()
         state=self.move(app,key,{'0':[0,0,0],'1':[.2,.1,0],'2':[0,0,0]})
         self.assertTrue(all(abs(v)<1e-12 for v in state['connections']['anchor_residuals'].values()))
@@ -152,7 +154,7 @@ class AutoEditingPolicyTests(unittest.TestCase):
     def test_policy_can_be_overridden_and_legacy_plans_keep_manual_controls(self):
         app,key,_,_=self.start()
         app.selectbox(key=f'policy_{key}_0_1_mode').set_value('cap_union').run()
-        self.assertEqual(app.session_state['part_editing']['connections']['boundary_blending']['selected_ids'],[2])
+        self.assertEqual(app.session_state['part_editing']['connections']['boundary_blending']['selected_ids'],[1,2])
         self.assertTrue(any(b.key=='solid_close_parts' for b in app.button))
         manifest,content=policy_fixture()
         del manifest['editing_policy']
