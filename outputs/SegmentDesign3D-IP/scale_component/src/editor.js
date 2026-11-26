@@ -9,6 +9,7 @@ import { applyDisplayOrientation, CAMERA_EYE, DISPLAY_UP, sourceToDisplay } from
 import { localOffset, setLocalOffset } from "./translation_frames.js";
 import { highlightPositions } from "./overlap_highlights.js";
 import { bindZeroDetent } from "./zero_detent.js";
+import { evaluateConnections } from "./connection_constraints.js";
 
 const viewport = document.getElementById("viewport");
 const sliderList = document.getElementById("sliders");
@@ -44,6 +45,10 @@ let blending = { parts: {}, anchors: {} };
 let blendingKey = null;
 let boundaryMotion = {parts: {}, anchors: {}};
 let motionKey = null;
+let solidConnections = null;
+let solidSourceKey = null;
+let connectionMeshes = new Map();
+let connectionStatus = document.getElementById("connection-status");
 let viewUpDir = null;
 let following = false;
 let showAnchors = false;
@@ -120,6 +125,75 @@ function keepInFrame() {
   if (radius + bounds.getCenter(new THREE.Vector3()).distanceTo(orbit.target) > cameraRadius * 1.25) fitView();
 }
 
+function connectionArgs() {
+  return { source_key: sourceKey, parts: partData, scales, offsets, follow: following, layout, blending,
+    boundary_motion: boundaryMotion, solid_connections: solidSourceKey === sourceKey ? solidConnections : null };
+}
+
+function clearConnectionMeshes() {
+  for (const mesh of connectionMeshes.values()) {
+    mesh.removeFromParent();
+    mesh.geometry.dispose();
+    mesh.material.dispose();
+  }
+  connectionMeshes.clear();
+}
+
+function updateConnectionPreview(result) {
+  if (!result.enabled) {
+    clearConnectionMeshes();
+    if (connectionStatus) { connectionStatus.hidden = true; connectionStatus.textContent = ""; }
+    return;
+  }
+  if (!connectionStatus) {
+    connectionStatus = document.createElement("p");
+    connectionStatus.id = "connection-status";
+    connectionStatus.className = "empty-label";
+    connectionStatus.setAttribute("role", "status");
+    sliderList.parentElement.insertBefore(connectionStatus, sliderList);
+  }
+  connectionStatus.hidden = false;
+  connectionStatus.textContent = result.valid
+    ? "閉鎖したパーツを移動中です。移動後に③「接続部を延長する」を押してください。"
+    : "閉鎖結果の表示データを確認してください。移動操作は続けられます。";
+  const visible = new Set();
+  if (group) for (const part of partData) {
+    const id = String(part.part_id), derived = result.preview.parts[id];
+    if (!derived?.faces.length) continue;
+    visible.add(id);
+    let mesh = connectionMeshes.get(id);
+    if (!mesh) {
+      mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial({
+        color: part.color, metalness: .02, roughness: .8, side: THREE.DoubleSide,
+        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+      }));
+      mesh.name = `${part.name} 接続面`;
+      group.add(mesh);
+      connectionMeshes.set(id, mesh);
+    }
+    if (mesh.geometry.getAttribute("position")?.count !== derived.vertices.length) {
+      mesh.geometry.dispose();
+      mesh.geometry = new THREE.BufferGeometry();
+      mesh.geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(derived.vertices.length * 3), 3));
+    }
+    const position = mesh.geometry.getAttribute("position");
+    derived.vertices.forEach((point, index) => position.setXYZ(index,
+      point[0] - part.center[0], point[1] - part.center[1], point[2] - part.center[2]));
+    position.needsUpdate = true;
+    mesh.geometry.setIndex(derived.faces);
+    mesh.geometry.computeVertexNormals();
+    mesh.geometry.computeBoundingBox();
+    mesh.geometry.computeBoundingSphere();
+    mesh.position.set(...part.center).sub(sceneCenter);
+  }
+  for (const [id, mesh] of connectionMeshes) if (!visible.has(id)) {
+    mesh.removeFromParent();
+    mesh.geometry.dispose();
+    mesh.material.dispose();
+    connectionMeshes.delete(id);
+  }
+}
+
 function updatePreview() {
   const automatic = solveTranslations(partData, scales, following ? layout.attachments : []);
   const translations = Object.fromEntries(partData.map(part => {
@@ -177,6 +251,7 @@ function updatePreview() {
     anchorPoints.visible = showAnchors;
     anchorLines.visible = showAnchors;
   }
+  updateConnectionPreview(evaluateConnections(connectionArgs()));
   updateOverlapHighlights();
   dirty = true;
   keepInFrame();
@@ -249,7 +324,8 @@ function formatOffset(value) {
 
 function updateOffset(partId, axis, value, redraw = true) {
   const id = String(partId);
-  offsets[id] = setLocalOffset(offsets[id], axis, value, movementFrames[id]);
+  const requested = { ...offsets, [id]: setLocalOffset(offsets[id], axis, value, movementFrames[id]) };
+  offsets[id] = requested[id];
   refreshOffsetControls(id);
   if (redraw) {
     pendingOverlaps = true;
@@ -300,11 +376,14 @@ function rebuild(args) {
   blendingKey = args.blending_key;
   boundaryMotion = args.boundary_motion;
   motionKey = args.motion_key;
+  solidConnections = args.solid_connections;
+  solidSourceKey = args.source_key;
   viewUpDir = args.up_dir;
   following = args.follow;
   showAnchors = args.show_anchors;
   widgets.clear();
   sliderList.replaceChildren();
+  clearConnectionMeshes();
   for (const overlay of overlapMeshes.values()) {
     overlay.removeFromParent();
     overlay.geometry.dispose();
@@ -547,8 +626,11 @@ Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
       showAnchors = args.show_anchors;
       blending = args.blending;
       boundaryMotion = args.boundary_motion;
+      solidConnections = args.solid_connections;
+      solidSourceKey = args.source_key;
       showMovementAxes = args.show_movement_axes;
-      if (!dragging && Number(args.sequence) >= sequence) {
+      // The exact server check can correct a rejected request at the same sequence.
+      if ((!dragging || solidConnections?.enabled === true) && Number(args.sequence) >= sequence) {
         sequence = Number(args.sequence);
         for (const [id, value] of Object.entries(args.scales)) updateScale(id, Number(value), false);
         for (const [id, value] of Object.entries(args.offsets)) {

@@ -15,6 +15,7 @@ from mesh_overlaps import METHOD as OVERLAP_METHOD, assemble_parts, find_face_ov
 from rejoining import export_rejoined_glb, export_rejoined_npz, has_rejoin_data, rejoin_input_key, rejoin_parts, rejoined_payload
 from viewer import mesh_figure, mesh_viewer_config
 from capping_panel import render_capping
+from solid_panel import closed_editor_payload, render_closure_stage, render_solid_result
 
 
 _component_directory = Path(__file__).with_name("scale_component") / "dist"
@@ -93,68 +94,69 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
     names = {part.part_id: part.name for part in parts}
     root_id = st.selectbox("基準パーツ（拡大縮小の位置を固定）", available,
                            format_func=lambda index: f"{names[index]} (ID {index})", key=f"connection_root_{source_key}")
-    follow = st.checkbox("接続位置に追従", value=True, disabled=not connections, key=f"connection_follow_{source_key}")
-    show_anchors = st.checkbox("接続点を表示", value=True, disabled=not connections, key=f"connection_points_{source_key}")
-    plan = build_connection_plan(parts, connections, root_id)
-    layout = connection_payload(plan)
-    for warning in warnings:
-        st.warning(warning)
-    if connections:
-        st.caption(f"接続領域：{len(connections)} / 追従に使用：{len(plan.attachments) if follow else 0}。緑の点は位置の一致、橙の点と線はずれを表します。")
-        st.caption("拡大縮小に伴う接続位置へ追従します。移動操作で境界を残す場合は、下の移動方法から断面固定移動を選んでください。")
-        if plan.unused_ids:
-            st.warning("輪状の接続または同じパーツ間の複数接続があります。境界の長い接続を優先して追従し、使わない接続のずれも表示します。")
-        if len(plan.roots) > 1:
-            st.caption("基準パーツにつながらないグループは、それぞれID最小の非空パーツの位置を固定します。")
-    elif len(available) > 1:
-        st.info("共有境界を検出できませんでした。離れたメッシュや頂点位置の異なる境界には、自動で接続を作りません。")
-    connected_ids = {index for item in connections for index in (item.part_a, item.part_b)}
-    selected = st.multiselect("境界なじませを適用するパーツ", [index for index in available if index in connected_ids] if can_rejoin else [],
-                             format_func=lambda index: f"{names[index]} (ID {index})", key=f"boundary_blend_parts_{source_key}")
-    percent = st.slider("境界なじませの範囲（%）", 1, 100, 20, disabled=not selected, key=f"boundary_blend_range_{source_key}")
-    st.caption("選択したパーツの境界を接続先に合わせ、内部へ向かって指定倍率に戻します。範囲は境界から最奥までのメッシュに沿った距離に対する割合です。手動XYZ移動は最後に加えます。")
-    with st.spinner("境界からの距離を計算しています"):
-        blending = _load_blending(content, result, tuple(sorted(selected)), percent / 100, root_id)
-    for warning in blending["warnings"]:
-        st.warning(warning)
-    motion_ratios = {}
-    with st.expander("パーツごとの移動方法"):
-        for part in parts:
-            enabled = can_rejoin and part.part_id in connected_ids and bool(len(part.faces))
-            mode = st.selectbox(f"{part.name} の移動方法", ["全体移動", "断面固定移動"], disabled=not enabled,
-                                key=f"boundary_motion_mode_{source_key}_{part.part_id}")
-            fixed = enabled and mode == "断面固定移動"
-            band = st.slider(f"{part.name} の遷移範囲（%）", 1, 100, 20, disabled=not fixed,
-                             key=f"boundary_motion_range_{source_key}_{part.part_id}")
-            if fixed:
-                motion_ratios[part.part_id] = band / 100
-        st.caption("断面固定移動は、移動前のすべての共有境界を固定し、メッシュに沿った距離に応じて指定移動量へ滑らかに近づけます。範囲は境界から最奥までの距離に対する割合です。")
-    with st.spinner("断面固定移動の重みを準備しています"):
-        motion = _load_motion(content, result, tuple(sorted(motion_ratios.items())))
-    for warning in motion["warnings"]:
-        st.warning(warning)
-    frame_mode = st.selectbox("移動方向の基準", ["断面の近似平面", "入力XYZ"], key=f"movement_mode_{source_key}")
-    choices = {}
-    with st.expander("移動軸の基準接続"):
-        for part_id in available:
-            candidates = sorted((item for item in connections if part_id in (item.part_a, item.part_b)),
-                                key=lambda item: (-item.boundary_length, item.connection_id))
-            if len(candidates) > 1:
-                labels = {item.connection_id: f"{names[item.part_b if item.part_a == part_id else item.part_a]} / 接続 {item.connection_id}" for item in candidates}
-                choices[part_id] = st.selectbox(names[part_id], list(labels), format_func=lambda index, labels=labels: labels[index],
-                                               disabled=frame_mode == "入力XYZ", key=f"movement_connection_{source_key}_{part_id}")
-        st.caption("複数の接続がある場合、初期値は境界が最も長い接続です。移動軸は元の境界から計算し、倍率や移動によって回転しません。")
-    frames = _load_frames(content, result, up_dir, tuple(sorted(choices.items())), frame_mode != "入力XYZ")
-    for frame in frames.values():
-        if frame["warning"]:
-            st.warning(frame["warning"])
-    show_axes = st.checkbox("移動軸を表示", value=True, key=f"movement_axes_show_{source_key}")
-    show_overlaps = st.checkbox("Faceの重なりを表示", value=True, key=f"show_overlaps_{source_key}")
-    st.caption("未編集時にはない新しい交差ペアのFaceだけを赤く表示します。判定はスライダーを離した後に更新します。編集は制限せず、保存するモデルは元のパーツ色を保持します。")
-    movement = translation_controls(parts)
-    # Narrow the displayed controls while preserving validation of earlier edits.
-    movement = {name: value * .2 for name, value in movement.items()}
-    st.caption(f"全体移動は接触を維持しません。断面固定移動は操作前の境界を固定します。軸の矢印は赤＝U、緑＝V、青＝N。断面がないパーツは入力XYZです。入力座標の単位で各軸 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
+    with st.expander("詳細な形状編集設定"):
+        follow = st.checkbox("接続位置に追従", value=True, disabled=not connections, key=f"connection_follow_{source_key}")
+        show_anchors = st.checkbox("接続点を表示", value=True, disabled=not connections, key=f"connection_points_{source_key}")
+        plan = build_connection_plan(parts, connections, root_id)
+        layout = connection_payload(plan)
+        for warning in warnings:
+            st.warning(warning)
+        if connections:
+            st.caption(f"接続領域：{len(connections)} / 追従に使用：{len(plan.attachments) if follow else 0}。緑の点は位置の一致、橙の点と線はずれを表します。")
+            st.caption("拡大縮小に伴う接続位置へ追従します。移動操作で境界を残す場合は、下の移動方法から断面固定移動を選んでください。")
+            if plan.unused_ids:
+                st.warning("輪状の接続または同じパーツ間の複数接続があります。境界の長い接続を優先して追従し、使わない接続のずれも表示します。")
+            if len(plan.roots) > 1:
+                st.caption("基準パーツにつながらないグループは、それぞれID最小の非空パーツの位置を固定します。")
+        elif len(available) > 1:
+            st.info("共有境界を検出できませんでした。離れたメッシュや頂点位置の異なる境界には、自動で接続を作りません。")
+        connected_ids = {index for item in connections for index in (item.part_a, item.part_b)}
+        selected = st.multiselect("境界なじませを適用するパーツ", [index for index in available if index in connected_ids] if can_rejoin else [],
+                                 format_func=lambda index: f"{names[index]} (ID {index})", key=f"boundary_blend_parts_{source_key}")
+        percent = st.slider("境界なじませの範囲（%）", 1, 100, 20, disabled=not selected, key=f"boundary_blend_range_{source_key}")
+        st.caption("選択したパーツの境界を接続先に合わせ、内部へ向かって指定倍率に戻します。範囲は境界から最奥までのメッシュに沿った距離に対する割合です。手動XYZ移動は最後に加えます。")
+        with st.spinner("境界からの距離を計算しています"):
+            blending = _load_blending(content, result, tuple(sorted(selected)), percent / 100, root_id)
+        for warning in blending["warnings"]:
+            st.warning(warning)
+        motion_ratios = {}
+        with st.expander("パーツごとの移動方法"):
+            for part in parts:
+                enabled = can_rejoin and part.part_id in connected_ids and bool(len(part.faces))
+                mode = st.selectbox(f"{part.name} の移動方法", ["全体移動", "断面固定移動"], disabled=not enabled,
+                                    key=f"boundary_motion_mode_{source_key}_{part.part_id}")
+                fixed = enabled and mode == "断面固定移動"
+                band = st.slider(f"{part.name} の遷移範囲（%）", 1, 100, 20, disabled=not fixed,
+                                 key=f"boundary_motion_range_{source_key}_{part.part_id}")
+                if fixed:
+                    motion_ratios[part.part_id] = band / 100
+            st.caption("断面固定移動は、移動前のすべての共有境界を固定し、メッシュに沿った距離に応じて指定移動量へ滑らかに近づけます。範囲は境界から最奥までの距離に対する割合です。")
+        with st.spinner("断面固定移動の重みを準備しています"):
+            motion = _load_motion(content, result, tuple(sorted(motion_ratios.items())))
+        for warning in motion["warnings"]:
+            st.warning(warning)
+        frame_mode = st.selectbox("移動方向の基準", ["断面の近似平面", "入力XYZ"], key=f"movement_mode_{source_key}")
+        choices = {}
+        with st.expander("移動軸の基準接続"):
+            for part_id in available:
+                candidates = sorted((item for item in connections if part_id in (item.part_a, item.part_b)),
+                                    key=lambda item: (-item.boundary_length, item.connection_id))
+                if len(candidates) > 1:
+                    labels = {item.connection_id: f"{names[item.part_b if item.part_a == part_id else item.part_a]} / 接続 {item.connection_id}" for item in candidates}
+                    choices[part_id] = st.selectbox(names[part_id], list(labels), format_func=lambda index, labels=labels: labels[index],
+                                                   disabled=frame_mode == "入力XYZ", key=f"movement_connection_{source_key}_{part_id}")
+            st.caption("複数の接続がある場合、初期値は境界が最も長い接続です。移動軸は元の境界から計算し、倍率や移動によって回転しません。")
+        frames = _load_frames(content, result, up_dir, tuple(sorted(choices.items())), frame_mode != "入力XYZ")
+        for frame in frames.values():
+            if frame["warning"]:
+                st.warning(frame["warning"])
+        show_axes = st.checkbox("移動軸を表示", value=True, key=f"movement_axes_show_{source_key}")
+        show_overlaps = st.checkbox("Faceの重なりを表示", value=True, key=f"show_overlaps_{source_key}")
+        st.caption("未編集時にはない新しい交差ペアのFaceだけを赤く表示します。判定はスライダーを離した後に更新します。赤色は表示専用で、保存するモデルは元のパーツ色を保持します。")
+        movement = translation_controls(parts)
+        # Narrow the displayed controls while preserving validation of earlier edits.
+        movement = {name: value * .2 for name, value in movement.items()}
+        st.caption(f"全体移動はパーツ全体を動かし、断面固定移動は操作前の境界を固定します。軸の矢印は赤＝U、緑＝V、青＝N。断面がないパーツは入力XYZです。入力座標の単位で各軸 ±{movement['limit']:.6g}、刻み {movement['step']:.6g}。")
     if follow and connections:
         edited, automatic = follow_connections(parts, state["scales"], plan)
     else:
@@ -162,6 +164,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         automatic = {part.part_id: np.zeros(3) for part in parts}
     uniform_parts = edited
     edited = apply_boundary_blend(parts, edited, state["scales"], automatic, blending)
+    baseline = edited
     # Manual offsets are applied after the whole attachment tree is solved; they never propagate.
     edited = apply_boundary_motion(edited, state["offsets"], motion)
     # Both boundary blending and boundary-fixed movement can create local
@@ -181,6 +184,9 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
                 "translations": {str(index): value.tolist() for index, value in translations.items()},
                 "anchor_residuals": {str(index): value for index, value in residuals.items()},
                 "boundary_blending": blend_info, "movement_frames": frames, "boundary_motion": motion_metadata(motion)}
+    closed_snapshot, solid_settings = render_closure_stage(
+        state, result, content, parts, baseline, metadata, up_dir, can_rejoin)
+    solid_payload = closed_editor_payload(closed_snapshot, source_key)
     overlap_report, overlap_faces = None, {}
     reference_report, reference_face_ids = None, None
     if show_overlaps:
@@ -196,9 +202,14 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         st.caption(f"新しく重なるFace：{count}面 / {overlap_report['pair_count']}組。未編集時の交差ペアは表示から除外しています。")
     state.update(edited_parts=edited, connections=metadata, overlap_report=overlap_report)
     sequence_before = state["sequence"]
+    st.subheader("② 閉じたパーツを移動")
+    st.caption("移動しても①の蓋を保持します。接続のための移動制限・自動巻き戻しは行いません。接続部の延長は③を押した時に作成します。")
+    if motion_ratios:
+        st.info("断面固定移動を選んでいるパーツがあります。断面を動かして延長を確認する場合は「詳細な形状編集設定 → パーツごとの移動方法」で全体移動を選んでください。")
     event = _component(
         source_key=source_key, parts=editor_payload(parts), scales=state["scales"],
-        editor_protocol=6, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
+        editor_protocol=8, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
+        solid_connections=solid_payload,
         boundary_motion=motion, motion_key=repr(sorted(motion_ratios.items())),
         movement_key=f"{frame_mode}:{sorted(choices.items())}",
         blending_key=f"{root_id}:{sorted(selected)}:{percent}",
@@ -223,49 +234,51 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         file_name=f"{result['segmentation_id']}_scaled.glb", mime="model/gltf-binary", icon=":material/download:", key="download_edited_glb",
     )
     revision = rejoin_input_key(source_key, state["scales"], metadata)
-    render_capping(state, content, result, parts, edited, revision, metadata, up_dir, can_rejoin)
-    if state.get("rejoined", {}).get("input_key") != revision:
-        state.pop("rejoined", None)
-    if st.button("一つのMeshへ結合", disabled=not can_rejoin, key="rejoin_mesh", icon=":material/join:"):
-        try:
-            with st.spinner("元の接続情報からメッシュを結合しています"):
-                joined = rejoin_parts(content, result, parts, edited)
-                state["rejoined"] = {"input_key": revision, "result": joined,
-                                     "glb": export_rejoined_glb(joined, source_key=source_key), "npz": export_rejoined_npz(joined)}
-        except Exception as error:
-            st.error(f"メッシュを結合できません：{error}")
-    if not can_rejoin:
-        st.caption("結合には、元頂点・元面の対応情報を含む分割NPZが必要です。")
-    if "rejoined" in state:
-        saved = state["rejoined"]
-        joined, statistics = saved["result"], saved["result"].statistics
-        st.subheader("結合結果")
-        st.caption(f"Mesh数：1 / 連結成分：{statistics['connected_components']} / 元の面：{statistics['original_faces']} / 追加した接続面：{statistics['bridge_faces']} / 統合した頂点：{statistics['welded_vertices']}")
-        if statistics["ambiguous_edges"]:
-            st.caption(f"3面以上が共有する境界エッジ{statistics['ambiguous_edges']}本は、橋渡し面の自動生成から除外しました。")
-        payload = rejoined_payload(joined)
-        if show_overlaps:
-            with st.spinner("結合後のFaceの重なりを検査しています"):
-                face_keys = np.where(joined.source_face_indices >= 0, joined.source_face_indices, -1 - np.arange(len(joined.mesh.faces)))
-                joined_vertices, joined_faces = np.asarray(joined.mesh.vertices), np.asarray(joined.mesh.faces)
-                joined_groups = np.full(len(joined_faces), -1, dtype=np.int64)
-                original_ids = np.flatnonzero(joined.source_face_indices >= 0)
-                assembled_ids = np.argsort(reference_face_ids)[joined.source_face_indices[original_ids]]
-                # Welding can move original vertices slightly. Only retain the
-                # uniform exemption for faces whose coordinates stayed exact;
-                # all changed originals and all new bridge faces are checked.
-                preserved = np.all(joined_vertices[joined_faces[original_ids]] == vertices[faces[assembled_ids]], axis=(1, 2))
-                joined_groups[original_ids[preserved]] = uniform_groups[assembled_ids[preserved]]
-                report = only_new_overlaps(_overlaps(joined_vertices, joined_faces, reference_report["frame"]),
-                                           reference_report, face_keys=face_keys, reference_face_keys=reference_face_ids,
-                                           uniform_groups=joined_groups)
-            saved["overlap_report"] = report
-            marked = set(report["face_ids"])
-            payload["face_colors"] = ["#e12b35" if index in marked else color for index, color in enumerate(payload["face_colors"])]
-            bridges = sum(bool(joined.is_bridge[index]) for index in marked)
-            st.caption(f"結合後の新しく重なるFace：{len(marked)}面（うち追加面：{bridges}面）/ {report['pair_count']}組。未編集時の交差ペアは表示から除外しています。")
-        st.plotly_chart(mesh_figure([payload], up_dir=up_dir), width="stretch", key=f"rejoined_view_{revision}_{up_dir}", config=mesh_viewer_config())
-        st.download_button("結合後 GLB", saved["glb"], file_name=f"{result['segmentation_id']}_rejoined.glb",
-                           mime="model/gltf-binary", key="download_rejoined_glb", icon=":material/download:")
-        st.download_button("結合後 NPZ", saved["npz"], file_name=f"{result['segmentation_id']}_rejoined.npz",
-                           mime="application/octet-stream", key="download_rejoined_npz", icon=":material/download:")
+    render_solid_result(state, result, content, parts, plan, solid_settings, closed_snapshot, motion, revision, metadata, up_dir)
+    with st.expander("従来の閉鎖・再結合を比較（詳細）"):
+        render_capping(state, content, result, parts, edited, revision, metadata, up_dir, can_rejoin)
+        if state.get("rejoined", {}).get("input_key") != revision:
+            state.pop("rejoined", None)
+        if st.button("一つのMeshへ結合", disabled=not can_rejoin, key="rejoin_mesh", icon=":material/join:"):
+            try:
+                with st.spinner("元の接続情報からメッシュを結合しています"):
+                    joined = rejoin_parts(content, result, parts, edited)
+                    state["rejoined"] = {"input_key": revision, "result": joined,
+                                         "glb": export_rejoined_glb(joined, source_key=source_key), "npz": export_rejoined_npz(joined)}
+            except Exception as error:
+                st.error(f"メッシュを結合できません：{error}")
+        if not can_rejoin:
+            st.caption("結合には、元頂点・元面の対応情報を含む分割NPZが必要です。")
+        if "rejoined" in state:
+            saved = state["rejoined"]
+            joined, statistics = saved["result"], saved["result"].statistics
+            st.subheader("結合結果")
+            st.caption(f"Mesh数：1 / 連結成分：{statistics['connected_components']} / 元の面：{statistics['original_faces']} / 追加した接続面：{statistics['bridge_faces']} / 統合した頂点：{statistics['welded_vertices']}")
+            if statistics["ambiguous_edges"]:
+                st.caption(f"3面以上が共有する境界エッジ{statistics['ambiguous_edges']}本は、橋渡し面の自動生成から除外しました。")
+            payload = rejoined_payload(joined)
+            if show_overlaps:
+                with st.spinner("結合後のFaceの重なりを検査しています"):
+                    face_keys = np.where(joined.source_face_indices >= 0, joined.source_face_indices, -1 - np.arange(len(joined.mesh.faces)))
+                    joined_vertices, joined_faces = np.asarray(joined.mesh.vertices), np.asarray(joined.mesh.faces)
+                    joined_groups = np.full(len(joined_faces), -1, dtype=np.int64)
+                    original_ids = np.flatnonzero(joined.source_face_indices >= 0)
+                    assembled_ids = np.argsort(reference_face_ids)[joined.source_face_indices[original_ids]]
+                    # Welding can move original vertices slightly. Only retain the
+                    # uniform exemption for faces whose coordinates stayed exact;
+                    # all changed originals and all new bridge faces are checked.
+                    preserved = np.all(joined_vertices[joined_faces[original_ids]] == vertices[faces[assembled_ids]], axis=(1, 2))
+                    joined_groups[original_ids[preserved]] = uniform_groups[assembled_ids[preserved]]
+                    report = only_new_overlaps(_overlaps(joined_vertices, joined_faces, reference_report["frame"]),
+                                               reference_report, face_keys=face_keys, reference_face_keys=reference_face_ids,
+                                               uniform_groups=joined_groups)
+                saved["overlap_report"] = report
+                marked = set(report["face_ids"])
+                payload["face_colors"] = ["#e12b35" if index in marked else color for index, color in enumerate(payload["face_colors"])]
+                bridges = sum(bool(joined.is_bridge[index]) for index in marked)
+                st.caption(f"結合後の新しく重なるFace：{len(marked)}面（うち追加面：{bridges}面）/ {report['pair_count']}組。未編集時の交差ペアは表示から除外しています。")
+            st.plotly_chart(mesh_figure([payload], up_dir=up_dir), width="stretch", key=f"rejoined_view_{revision}_{up_dir}", config=mesh_viewer_config())
+            st.download_button("結合後 GLB", saved["glb"], file_name=f"{result['segmentation_id']}_rejoined.glb",
+                               mime="model/gltf-binary", key="download_rejoined_glb", icon=":material/download:")
+            st.download_button("結合後 NPZ", saved["npz"], file_name=f"{result['segmentation_id']}_rejoined.npz",
+                               mime="application/octet-stream", key="download_rejoined_npz", icon=":material/download:")

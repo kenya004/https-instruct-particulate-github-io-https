@@ -6,6 +6,7 @@ used for triangulation and diagnostics, never to flatten boundary vertices.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, replace
 import hashlib
 import io
@@ -41,7 +42,17 @@ class CappedPart:
 
     @property
     def is_cap_center(self):
+        if "cap_center_vertex_ids" in self.statistics:
+            centers = np.zeros(len(self.part.vertices), dtype=bool)
+            centers[np.asarray(self.statistics["cap_center_vertex_ids"], dtype=np.int64)] = True
+            return centers
         return self.source_vertex_indices < 0
+
+    @property
+    def is_extension(self):
+        extensions = np.zeros(len(self.part.faces), dtype=bool)
+        extensions[np.asarray(self.statistics.get("extension_face_ids", []), dtype=np.int64)] = True
+        return extensions
 
 
 @dataclass(frozen=True)
@@ -443,9 +454,172 @@ def cut_loop_catalog(content, manifest, original):
     return _cut_loop_catalog(original, local_sources, cuts)
 
 
+def _source_ring_edges(source_ids):
+    return tuple(sorted(tuple(sorted((int(a), int(b))))
+                        for a, b in zip(source_ids, np.roll(source_ids, -1))))
+
+
+def _cap_geometry_statistics(part, before, sources, cut_edges, base_count, check_intersections):
+    """Also used after replacing a cap, so face diagnostics describe the output."""
+    faces = part.faces
+    mesh = trimesh.Trimesh(vertices=part.vertices, faces=faces, process=False)
+    cap_triangles = part.vertices[faces[base_count:]]
+    frame = overlap_frame(before.vertices)
+    doubled_areas = np.linalg.norm(np.cross((cap_triangles[:, 1] - cap_triangles[:, 0]) / frame["scale"],
+                                            (cap_triangles[:, 2] - cap_triangles[:, 0]) / frame["scale"]), axis=1)
+    degenerate = (np.flatnonzero(doubled_areas <= 1e-18) + base_count).tolist()
+    cap_pairs = np.zeros((0, 2), dtype=np.int64)
+    if check_intersections and len(cap_triangles):
+        report = find_face_overlaps(part.vertices, faces, frame=frame)
+        pairs = np.asarray(report["pairs"], dtype=np.int64).reshape(-1, 2)
+        cap_pairs = pairs[np.any(pairs >= base_count, axis=1)]
+    remaining, _ = _boundary(faces)
+    remaining_cut = sum(tuple(sorted(map(int, sources[edge]))) in cut_edges
+                        for edge in remaining if np.all(edge < len(before.vertices)))
+    return {"cut_boundary_edges_after": int(remaining_cut), "remaining_boundary_edges": len(remaining),
+            "degenerate_cap_faces": len(degenerate), "degenerate_cap_face_ids": degenerate,
+            "is_watertight": bool(mesh.is_watertight) if len(faces) else False,
+            "is_winding_consistent": bool(mesh.is_winding_consistent),
+            "intersections_checked": check_intersections,
+            "cap_overlap_pairs": cap_pairs.tolist(), "cap_overlap_face_ids": np.unique(cap_pairs).tolist(),
+            "cap_overlap_pair_count": len(cap_pairs)}
+
+
+def _mapped_triangulation(info, vertex_map, vertices):
+    info = deepcopy(info)
+    if "center_vertex" in info:
+        info["center_vertex"] = vertex_map[info["center_vertex"]]
+        info["center"] = vertices[info["center_vertex"]].tolist()
+    for candidate in info.get("candidate_sample", []):
+        for field in ("vertices", "interior_vertices"):
+            candidate[field] = [vertex_map[node] for node in candidate[field]]
+    return info
+
+
+def _reuse_shared_caps(records, original, local_sources, cuts, current_loop_owners, tolerance, check_intersections):
+    """Reuse a whole patch only for an unambiguous, oppositely directed source cut.
+
+    Coordinates decide whether an immutable pairing is still in contact; they
+    never establish a pairing or weld vertices. Each ring must have exactly two
+    owners in both the rest mesh and the current cuts, including skipped cuts.
+    """
+    rest_loop_owners = defaultdict(list)
+    for item in _cut_loop_catalog(original, local_sources, cuts):
+        part_id = item["part_id"]
+        key = _source_ring_edges(local_sources[part_id][item["vertices"]])
+        rest_loop_owners[key].append(part_id)
+    groups = defaultdict(list)
+    for index, record in enumerate(records):
+        sources = local_sources[record.part.part_id]
+        for section in record.statistics["sections"]:
+            rings = [np.asarray(ring, dtype=np.int64) for ring in section["boundary_loops"]]
+            nodes = np.concatenate(rings)
+            # A repeated canonical node would make the correspondence ambiguous.
+            if len(set(map(int, sources[nodes]))) != len(nodes):
+                continue
+            ring_keys = [_source_ring_edges(sources[ring]) for ring in rings]
+            key = (ring_keys[0], tuple(sorted(ring_keys[1:])))
+            directed = {(int(sources[a]), int(sources[b])) for ring in rings
+                        for a, b in zip(ring, np.roll(ring, -1))}
+            groups[key].append({"index": index, "section": section, "ring_keys": ring_keys,
+                                "nodes": dict(zip(map(int, sources[nodes]), map(int, nodes))),
+                                "directed": directed})
+    replacements, vertices = defaultdict(dict), {}
+    shared_count = 0
+    for key in sorted(groups):
+        entries = groups[key]
+        if len(entries) != 2:
+            continue
+        part_ids = sorted(records[entry["index"]].part.part_id for entry in entries)
+        if (part_ids[0] == part_ids[1]
+                or any(sorted(rest_loop_owners[ring]) != part_ids
+                       or sorted(current_loop_owners[ring]) != part_ids for ring in entries[0]["ring_keys"])):
+            continue
+        # A requested nonzero start wins over the default. If both are changed,
+        # the smaller part ID wins, independently of input/dictionary order.
+        source, target = sorted(entries, key=lambda entry: (
+            not any(start["start_offset"] for start in entry["section"]["start_vertices"]),
+            records[entry["index"]].part.part_id))
+        if target["directed"] != {(b, a) for a, b in source["directed"]}:
+            continue
+        source_record, target_record = (records[entry["index"]] for entry in (source, target))
+        source_nodes = sorted(source["nodes"])
+        source_ids = [source["nodes"][node] for node in source_nodes]
+        target_ids = [target["nodes"][node] for node in source_nodes]
+        delta = source_record.part.vertices[source_ids] - target_record.part.vertices[target_ids]
+        if np.any(np.linalg.norm(delta, axis=1) > tolerance):
+            continue
+        source_section, target_section = source["section"], target["section"]
+        vertex_map = dict(zip(source_ids, target_ids))
+        source_center = source_section["triangulation"].get("center_vertex")
+        target_center = target_section["triangulation"].get("center_vertex")
+        if (source_center is None) != (target_center is None):
+            continue
+        if source_center is not None:
+            vertex_map[source_center] = target_center
+        patch = source_record.part.faces[source_record.cap_ids == source_section["cap_id"]]
+        if any(int(node) not in vertex_map for node in np.unique(patch)):
+            continue
+        shared_patch = np.array([[vertex_map[int(node)] for node in face[::-1]] for face in patch], dtype=np.int64)
+        boundary, nonmanifold = _boundary(shared_patch)
+        required = {(int(b), int(a)) for ring in target_section["boundary_loops"]
+                    for a, b in zip(ring, np.roll(ring, -1))}
+        if nonmanifold or set(map(tuple, boundary)) != required:
+            continue
+        target_index = target["index"]
+        if source_center is not None:
+            if target_index not in vertices:
+                vertices[target_index] = target_record.part.vertices.copy()
+            vertices[target_index][target_center] = source_record.part.vertices[source_center]
+        target_vertices = vertices.get(target_index, target_record.part.vertices)
+        target_section["triangulation"] = _mapped_triangulation(source_section["triangulation"], vertex_map, target_vertices)
+        target_section["added_faces"] = len(shared_patch)
+        replacements[target_index][target_section["cap_id"]] = shared_patch
+        shared_source = {"part_id": source_record.part.part_id, "cap_id": source_section["cap_id"],
+                         "start_vertices": source_section["start_vertices"]}
+        for entry, peer in ((source, target), (target, source)):
+            entry["section"].update(shared_cap=True, shared_cap_id=shared_count,
+                paired_part_id=records[peer["index"]].part.part_id, paired_cap_id=peer["section"]["cap_id"],
+                shared_cap_source=deepcopy(shared_source), shared_cap_reversed=entry is target)
+        shared_count += 1
+    before_by_id = {part.part_id: part for part in original}
+    for index, record in enumerate(records):
+        stats = record.statistics
+        stats["shared_caps_count"] = sum(section["shared_cap"] for section in stats["sections"])
+        if index not in replacements:
+            continue
+        base_count = int(np.count_nonzero(~record.is_cap))
+        patches = [replacements[index].get(section["cap_id"], record.part.faces[record.cap_ids == section["cap_id"]])
+                   for section in stats["sections"]]
+        added = np.vstack(patches)
+        flags = np.concatenate([np.full(len(patch), section["cap_id"], dtype=np.int64)
+                                for section, patch in zip(stats["sections"], patches)])
+        part = replace(record.part, vertices=vertices.get(index, record.part.vertices),
+                       faces=np.vstack([record.part.faces[:base_count], added]))
+        stats.update(added_faces=len(added), added_vertices=int(np.count_nonzero(record.is_cap_center)),
+                     projected_problem_sections=sum(not section["triangulation"].get("projected_coverage_valid", True)
+                                                    for section in stats["sections"]))
+        stats.update(_cap_geometry_statistics(part, before_by_id[part.part_id], local_sources[part.part_id],
+                                             cuts[part.part_id], base_count, check_intersections))
+        records[index] = replace(record, part=part,
+            source_face_indices=np.r_[record.source_face_indices[:base_count], np.full(len(added), -1, dtype=np.int64)],
+            cap_ids=np.r_[record.cap_ids[:base_count], flags])
+    return shared_count
+
+
 def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity=MAX_PLANARITY,
-              allow_nonplanar=False, triangulation="earcut", start_offsets=None) -> CappingResult:
-    """Close only original segmentation cuts on each *current* part, on CPU."""
+              allow_nonplanar=False, triangulation="earcut", start_offsets=None, shared_caps=False,
+              check_intersections=True) -> CappingResult:
+    """Close original cuts on current parts; optionally reuse coincident paired caps.
+
+    Successful sections expose ordered local ``boundary_loops``. Shared sections
+    additionally identify their peer, canonical ``source_boundary_edges``, and
+    the actual ``shared_cap_source`` (including its requested start positions).
+    ``shared_caps_count`` counts distinct patches globally and shared sections
+    per part. The coincidence tolerance is 1e-10 times the overall rest extent.
+    Disabling ``check_intersections`` leaves overlap arrays empty and marks
+    ``intersections_checked`` false; other geometry diagnostics still run.
+    """
     try:
         import mapbox_earcut as earcut
         from shapely import union_all
@@ -456,6 +630,10 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
         raise ValueError("断面の非平面性の許容割合が不正です。")
     if type(allow_nonplanar) is not bool:
         raise ValueError("非平面断面の試行設定は真偽値で指定してください。")
+    if type(shared_caps) is not bool:
+        raise ValueError("共有する蓋の設定は真偽値で指定してください。")
+    if type(check_intersections) is not bool:
+        raise ValueError("面の交差確認の設定は真偽値で指定してください。")
     if triangulation not in TRIANGULATIONS:
         raise ValueError("断面の三角形分割方式が不正です。")
     offsets = {} if start_offsets is None else start_offsets.copy() if isinstance(start_offsets, dict) else None
@@ -473,6 +651,7 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
     if set(current) != {part.part_id for part in original} or len(current) != len(edited):
         raise ValueError("断面閉鎖の対象パーツが一致しません。")
     seen_starts = set()
+    current_loop_owners = defaultdict(list)
     result, next_cap = [], 0
     for before in original:
         part = current[before.part_id]
@@ -485,6 +664,9 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
         is_cut = np.array([edge in cuts[part.part_id] for edge in boundary_sources], dtype=bool)
         original_open_count = sum(edge in original_open for edge in boundary_sources)
         loops, skipped = _loops(boundary[is_cut])
+        if shared_caps:
+            for loop in loops:
+                current_loop_owners[_source_ring_edges(local_sources[part.part_id][loop])].append(part.part_id)
         regions, invalid, loop_planarity = _cap_regions(part.vertices, loops, max_planarity, Polygon, allow_nonplanar=allow_nonplanar)
         skipped.extend(invalid)
         starts_by_key = {}
@@ -518,6 +700,10 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
             added.extend(triangles.tolist())
             cap_ids.extend([next_cap] * len(triangles))
             closed.append({"cap_id": next_cap, "loops": len(rings), "holes": len(rings) - 1,
+                           "boundary_loops": [ring.tolist() for ring in shifted_rings],
+                           "source_boundary_edges": [list(edge) for edge in sorted(
+                               edge for ring in rings for edge in _source_ring_edges(local_sources[part.part_id][ring]))],
+                           "shared_cap": False,
                            "boundary_edges": sum(map(len, rings)), "added_faces": len(triangles),
                            "added_vertices": int(triangulation == "center_fan"),
                            "planarity": frame["planarity"], "nonplanar": frame["planarity"] > max_planarity,
@@ -526,43 +712,34 @@ def cap_parts(content: bytes, manifest: dict, original, edited, *, max_planarity
         faces = np.vstack([base, np.asarray(added, dtype=np.int64).reshape(-1, 3)])
         vertices = np.vstack([part.vertices, np.asarray(centers, dtype=float).reshape(-1, 3)])
         updated = replace(part, vertices=vertices, faces=faces)
-        mesh = trimesh.Trimesh(vertices=updated.vertices, faces=faces, process=False)
         source_vertices, source_faces = provenance[part.part_id]
         if centers:
             source_vertices = np.r_[source_vertices.astype(np.int64), np.full(len(centers), -1, dtype=np.int64)]
         flags = np.r_[np.full(len(base), -1, dtype=np.int64), np.asarray(cap_ids, dtype=np.int64)]
-        cap_triangles = updated.vertices[faces[len(base):]]
-        extent = overlap_frame(before.vertices)["scale"]
-        doubled_areas = np.linalg.norm(np.cross((cap_triangles[:, 1] - cap_triangles[:, 0]) / extent,
-                                                (cap_triangles[:, 2] - cap_triangles[:, 0]) / extent), axis=1)
-        degenerate = (np.flatnonzero(doubled_areas <= 1e-18) + len(base)).tolist()
-        cap_pairs = np.zeros((0, 2), dtype=np.int64)
-        if added:
-            report = find_face_overlaps(updated.vertices, faces, frame=overlap_frame(before.vertices))
-            pairs = np.asarray(report["pairs"], dtype=np.int64).reshape(-1, 2)
-            cap_pairs = pairs[np.any(pairs >= len(base), axis=1)]
-        remaining, _ = _boundary(faces)
-        remaining_cut = sum(tuple(sorted(map(int, local_sources[part.part_id][edge]))) in cuts[part.part_id]
-                            for edge in remaining if np.all(edge < len(part.vertices)))
         statistics = {"part_id": part.part_id, "name": part.name, "closed_sections": len(closed), "closed_loops": sum(c["loops"] for c in closed),
             "sections": closed, "skipped": skipped, "loop_planarity": loop_planarity,
             "nonplanar_sections": sum(c["nonplanar"] for c in closed), "cut_boundary_edges_before": int(is_cut.sum()),
-            "cut_boundary_edges_after": int(remaining_cut), "original_open_edges": original_open_count,
+            "original_open_edges": original_open_count,
             "other_boundary_edges": int((~is_cut).sum()) - original_open_count,
-            "remaining_boundary_edges": len(remaining), "ambiguous_source_edges": ambiguous[part.part_id],
+            "ambiguous_source_edges": ambiguous[part.part_id],
             "nonmanifold_edges": nonmanifold, "added_faces": len(added), "added_vertices": len(centers),
+            "cap_center_vertex_ids": list(range(len(part.vertices), len(vertices))),
             "projected_problem_sections": sum(not c["triangulation"].get("projected_coverage_valid", True) for c in closed),
-            "degenerate_cap_faces": len(degenerate), "degenerate_cap_face_ids": degenerate,
+            "shared_caps_count": 0,
             "welded_seam_vertices": len(representatives) - len(set(representatives)),
-            "is_watertight": bool(mesh.is_watertight) if len(faces) else False,
-            "is_winding_consistent": bool(mesh.is_winding_consistent),
-            "cap_overlap_pairs": cap_pairs.tolist(), "cap_overlap_face_ids": np.unique(cap_pairs).tolist(),
-            "cap_overlap_pair_count": len(cap_pairs)}
+            **_cap_geometry_statistics(updated, before, local_sources[part.part_id], cuts[part.part_id], len(base), check_intersections)}
         result.append(CappedPart(updated, source_vertices, np.r_[source_faces, np.full(len(added), -1, dtype=np.int64)], flags, statistics))
     if set(offsets) - seen_starts:
         raise ValueError("開始頂点の対象断面を現在の編集形状で特定できません。境界のつながりを確認してください。")
+    shared_count = 0
+    rest_vertices = np.vstack([part.vertices for part in original])
+    shared_tolerance = overlap_frame(rest_vertices)["scale"] * 1e-10
+    if shared_caps:
+        shared_count = _reuse_shared_caps(result, original, local_sources, cuts, current_loop_owners, shared_tolerance, check_intersections)
     statistics = {"method": METHOD, "max_planarity": max_planarity, "allow_nonplanar": allow_nonplanar, "triangulation": triangulation,
                   "start_offsets": offsets,
+                  "shared_caps": shared_caps, "shared_caps_count": shared_count, "shared_cap_tolerance": shared_tolerance,
+                  "check_intersections": check_intersections,
                   "added_vertices": sum(p.statistics["added_vertices"] for p in result),
                   "projected_problem_sections": sum(p.statistics["projected_problem_sections"] for p in result),
                   "degenerate_cap_faces": sum(p.statistics["degenerate_cap_faces"] for p in result),
@@ -607,7 +784,8 @@ def export_capped_glb(result, *, source_key, editing_metadata):
         mesh = trimesh.Trimesh(vertices=part.vertices.copy(), faces=part.faces.copy(), process=False)
         mesh.visual.face_colors = trimesh.visual.color.hex_to_rgba(part.color)
         mesh.metadata.update(part_id=part.part_id, part_name=part.name, cap_face_indices=np.flatnonzero(record.is_cap).tolist(),
-                             cap_center_vertex_indices=np.flatnonzero(record.is_cap_center).tolist())
+                             cap_center_vertex_indices=np.flatnonzero(record.is_cap_center).tolist(),
+                             extension_face_indices=np.flatnonzero(record.is_extension).tolist())
         scene.add_geometry(mesh, geom_name=part.geometry_name, node_name=part.node_name, transform=np.eye(4))
     return scene.export(file_type="glb")
 
@@ -623,7 +801,8 @@ def export_capped_npz(result, *, source_key, editing_metadata):
             f"{prefix}_source_face_indices": record.source_face_indices,
             f"{prefix}_face_part_ids": np.full(len(part.faces), part.part_id, dtype=np.int32),
             f"{prefix}_face_colors": np.tile(trimesh.visual.color.hex_to_rgba(part.color), (len(part.faces), 1)),
-            f"{prefix}_is_cap": record.is_cap, f"{prefix}_cap_ids": record.cap_ids})
+            f"{prefix}_is_cap": record.is_cap, f"{prefix}_cap_ids": record.cap_ids,
+            f"{prefix}_is_extension": record.is_extension})
     buffer = io.BytesIO()
     np.savez_compressed(buffer, **arrays)
     return buffer.getvalue()

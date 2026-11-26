@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 
-METHOD = "triangle_bvh_overlap_v3"
+METHOD = "triangle_bvh_overlap_v4"
 
 
 def overlap_frame(vertices):
@@ -62,7 +62,13 @@ def _intersecting_pairs(triangles, normals, pairs, tolerance):
         overlap = np.minimum(pa.max(axis=2), pb.max(axis=2)) - np.maximum(pa.min(axis=2), pb.min(axis=2))
         positive_area = np.all(overlap > tolerance * np.linalg.norm(axes, axis=2), axis=1)
         result[active[indices[positive_area]]] = True
-    indices = np.flatnonzero(~coplanar)
+    # Two distinct triangle planes which share an exact edge can meet only
+    # along that edge. Solving their plane intersection is ill-conditioned
+    # when the normals are almost parallel and can invent an interior hit.
+    # Keep the coplanar area test above: folded or duplicate coplanar faces
+    # sharing an edge can still have a real positive-area overlap.
+    common = np.any(np.all(a[:, :, None, :] == b[:, None, :, :], axis=3), axis=2).sum(axis=1)
+    indices = np.flatnonzero(~coplanar & (common < 2))
     if len(indices):
         line = np.cross(na[indices], nb[indices])
         norm = np.linalg.norm(line, axis=1)

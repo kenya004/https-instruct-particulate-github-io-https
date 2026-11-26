@@ -55,6 +55,29 @@ def changing_bounds_fixture():
 
 
 class MeshOverlapTests(unittest.TestCase):
+    def test_almost_coplanar_shared_edge_is_not_an_interior_crossing(self):
+        # A rotated quad with a 1e-8 out-of-plane displacement. The old
+        # plane-intersection solve drifted off its exact common edge.
+        vertices = np.array([
+            [.08372055377399257, .05850190382588155, .12450804713516017],
+            [-.2896386089241264, -.25673252352314846, .9969931137370414],
+            [-.6984083001407791, -.4842225374692603, .39603085776963015],
+            [-.3994459090474496, -.2149967387277793, -.5249137431721262]])
+        faces = np.array([[0, 1, 2], [0, 2, 3]])
+        for scale in (1e-3, 1, 1e3):
+            points = vertices * scale + [2, -3, 4]
+            frame = {"origin": [2, -3, 4], "scale": scale}
+            self.assertEqual(find_face_overlaps(points, faces, frame=frame)["pair_count"], 0)
+            # Separate vertex IDs along a seam still describe the same edge.
+            self.assertEqual(find_face_overlaps(points[faces].reshape(-1, 3),
+                np.arange(6).reshape(-1, 3), frame=frame)["pair_count"], 0)
+
+    def test_shared_edge_area_overlap_and_shared_vertex_crossing_still_count(self):
+        first = [[0, 0, 0], [2, 0, 0], [0, 2, 0]]
+        for second in ([[0, 0, 0], [2, 0, 0], [.5, .5, 0]],
+                       [[0, 0, 0], [1, .2, 1], [.2, 1, -1]]):
+            self.assertEqual(triangles_report([first, second])["pair_count"], 1)
+
     def test_distant_motion_does_not_change_tolerance_or_stationary_pairs(self):
         manifest, artifacts = changing_bounds_fixture()
         parts = load_editable_parts(artifacts["parts.npz"], manifest)
