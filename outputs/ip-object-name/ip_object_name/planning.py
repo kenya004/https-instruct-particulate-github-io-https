@@ -13,12 +13,18 @@ from . import core
 from .store import ModelStore, error_details, utc_now, write_json
 
 
+EditParameter = Literal["uniform_scale", "translate_u", "translate_v", "translate_n"]
+
+
 class PlannedRegion(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str = Field(min_length=1, max_length=80)
     label: str = Field(min_length=1, max_length=80)
     description: str = Field(min_length=1, max_length=300)
     is_edit_target: bool
+    # None is only for loading saved plans created before parameter selection.
+    edit_parameters: list[EditParameter] | None = Field(default=None, max_length=4)
+    parameter_reason: str | None = Field(default=None, min_length=1, max_length=400)
 
     @field_validator("name", "label", "description")
     @classmethod
@@ -27,6 +33,19 @@ class PlannedRegion(BaseModel):
         if not value:
             raise ValueError("Part fields cannot be blank.")
         return value
+
+    @model_validator(mode="after")
+    def valid_parameters(self):
+        if self.edit_parameters is None and self.parameter_reason is None:
+            return self
+        if self.edit_parameters is None or self.parameter_reason is None or not self.parameter_reason.strip():
+            raise ValueError("Specify edit parameters and their selection reason for every part.")
+        if len(set(self.edit_parameters)) != len(self.edit_parameters):
+            raise ValueError("Edit parameters must not be duplicated.")
+        if not self.is_edit_target and self.edit_parameters:
+            raise ValueError("Unedited parts cannot have editing controls; they may follow automatically.")
+        self.parameter_reason = " ".join(self.parameter_reason.split())
+        return self
 
 
 class PlannedConnection(BaseModel):
@@ -116,8 +135,11 @@ def _part_plan_response_schema() -> dict:
                         "label": {"type": "STRING"},
                         "description": {"type": "STRING"},
                         "is_edit_target": {"type": "BOOLEAN"},
+                        "edit_parameters": {"type": "ARRAY", "items": {"type": "STRING",
+                            "enum": ["uniform_scale", "translate_u", "translate_v", "translate_n"]}},
+                        "parameter_reason": {"type": "STRING"},
                     },
-                    "required": ["name", "label", "description", "is_edit_target"],
+                    "required": ["name", "label", "description", "is_edit_target", "edit_parameters", "parameter_reason"],
                 },
             },
             "warnings": {"type": "ARRAY", "items": {"type": "STRING"}},
@@ -159,6 +181,10 @@ def request_part_plan(object_name: str, edit_request: str, *, model: str) -> tup
         prediction = PartPlanPrediction.model_validate_json(response.text)
         if prediction.base_part is None or prediction.connections is None:
             raise ValueError("The LLM omitted the editing policy.")
+        if any(p.edit_parameters is None or p.parameter_reason is None for p in prediction.parts):
+            raise ValueError("The LLM omitted editing parameter selection.")
+        if any(p.is_edit_target and not p.edit_parameters for p in prediction.parts):
+            raise ValueError("The LLM must select an exact or closest available control for each edit target.")
     except (TypeError, ValueError, ValidationError) as error:
         raise core.VLMError("The LLM returned an invalid part list.") from error
     return prediction, getattr(response, "model_version", None)

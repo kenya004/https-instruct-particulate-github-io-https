@@ -132,7 +132,7 @@ def editor_source_key(manifest: dict, content: bytes) -> str:
     return hashlib.sha256(identity.encode() + b":" + content).hexdigest()
 
 
-def synchronize_editor(state: dict, source_key: str, parts: tuple[EditablePart, ...], event=None, *, movement_frames=None) -> dict:
+def synchronize_editor(state: dict, source_key: str, parts: tuple[EditablePart, ...], event=None, *, movement_frames=None, controls=None) -> dict:
     if state.get("source_key") != source_key:
         state.clear()
         state.update(source_key=source_key, scales={str(part.part_id): 1.0 for part in parts}, sequence=0)
@@ -150,6 +150,9 @@ def synchronize_editor(state: dict, source_key: str, parts: tuple[EditablePart, 
             scales = validate_scales(parts, event.get("scales"))
             offsets = validate_offsets(parts, event.get("offsets", state["offsets"]), limit=translation_controls(parts)["limit"],
                                        movement_frames=movement_frames, previous_offsets=state["offsets"] if movement_frames is not None else None)
+            from edit_controls import validate_control_changes
+            validate_control_changes(parts, state["scales"], state["offsets"], scales, offsets, controls,
+                                     movement_frames, reset=event.get("reset") is True)
             state.update(scales=scales, offsets=offsets, sequence=sequence)
     return state
 

@@ -21,11 +21,12 @@ if getattr(editing, "EDITING_PROTOCOL", 0) < 2:
     importlib.reload(editing)
 if "plane_normal" not in connections.Connection.__dataclass_fields__:
     importlib.reload(connections)
-refresh_ui_modules(names=("connection_planes", "orientation", "movement_axes", "connections", "workflow", "boundary_blending", "boundary_motion", "rejoining", "mesh_overlaps", "viewer", "capping", "capping_panel", "connection_overlap", "boolean_union", "editing_policy", "solid_panel", "part_editor"))
+refresh_ui_modules(names=("connection_planes", "orientation", "movement_axes", "connections", "workflow", "boundary_blending", "boundary_motion", "rejoining", "mesh_overlaps", "viewer", "capping", "capping_panel", "connection_overlap", "boolean_union", "editing_policy", "edit_controls", "solid_panel", "part_editor"))
 
 from backend_client import BackendClient, BackendError
 from orientation import aligned_mesh_payloads
 from part_editor import render_part_editor
+from edit_controls import parameter_text
 from viewer import load_mesh_payloads, load_segmented_payloads, mesh_figure, mesh_viewer_config
 from workflow import (
     ORDER_LABELS, REFINEMENT_ORDERS, STAGE_LABELS, boundary_already_applied, clear_refinements,
@@ -139,7 +140,8 @@ plan = state.get("plan")
 if plan:
     st.write(plan["summary"])
     rows = [
-        {"ID": part["part_id"], "パーツ名": part["name"], "形状の説明": part["description"], "編集対象": part["is_edit_target"]}
+        {"ID": part["part_id"], "パーツ名": part["name"], "形状の説明": part["description"], "編集対象": part["is_edit_target"],
+         "編集操作": parameter_text(part), "選択理由": part.get("parameter_reason") or ""}
         for part in plan["parts"]
     ]
     st.dataframe(rows, hide_index=True, width="stretch")

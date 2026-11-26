@@ -129,6 +129,20 @@ class SegmentationTests(unittest.TestCase):
         self.assertFalse(response.json()["options"]["enforce_connectivity_per_part"])
         self.assertFalse(self.runner.call_args.args[3].enforce_connectivity_per_part)
 
+    def test_selected_parameters_survive_segmentation_and_refinement_exports(self):
+        for part in self.plan["parts"]:
+            part.update(edit_parameters=["uniform_scale"] if part["is_edit_target"] else [],
+                        parameter_reason="編集要求で選択" if part["is_edit_target"] else "編集対象外")
+        write_json(self.folder / "part_plan.json", self.plan)
+        result = self.segment()
+        saved = self.client.get(result["files"]["parts.json"]).json()
+        refined = export_partition(self.partition, self.plan, self.root / "refined-controls", "d" * 32)
+        for exported in (result, saved, refined):
+            for original, part in zip(self.plan["parts"], exported["parts"]):
+                self.assertEqual(part["edit_parameters"], original["edit_parameters"])
+                self.assertEqual(part["parameter_reason"], original["parameter_reason"])
+        self.runner.assert_called_once_with(Path(self.metadata["input_mesh"]), ["first", "second", "empty"], "+Y", SegmentationOptions())
+
     def test_plan_is_bound_to_model_and_source(self):
         self.plan["model_id"] = "f" * 32
         write_json(self.folder / "part_plan.json", self.plan)

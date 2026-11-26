@@ -18,6 +18,7 @@ from viewer import mesh_figure, mesh_viewer_config
 from capping_panel import render_capping
 from solid_panel import closed_editor_payload, render_closure_stage, render_solid_result, render_blended_result
 from editing_policy import render_policy, connection_settings
+from edit_controls import controls_for
 
 
 _component_directory = Path(__file__).with_name("scale_component") / "dist"
@@ -113,6 +114,11 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
     synchronize_editor(state, source_key, parts)
     available = [part.part_id for part in parts if len(part.faces)]
     names = {part.part_id: part.name for part in parts}
+    try:
+        controls = controls_for(result, analysis)
+    except ValueError as error:
+        st.error(str(error))
+        return
     policy = render_policy(result, analysis, parts, connections, source_key)
     auto_selected, blend_references, blend_ids = connection_settings(policy, connections)
     # This reference is only for closure/extension roles, not following or blending.
@@ -221,6 +227,7 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
     if blend_info["conflicting_fixed_vertices"]:
         st.warning("同じ境界頂点に接する複数の未選択パーツの位置が一致していません。基準パーツ、次にID順で接続先を選びます。")
     metadata = {**layout, "enabled": bool(follow and connections), "root_id": root_id,
+                "edit_controls": controls,
                 "automatic_translations": {str(index): value.tolist() for index, value in automatic.items()},
                 "manual_translations": state["offsets"],
                 "translations": {str(index): value.tolist() for index, value in translations.items()},
@@ -255,13 +262,20 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
     state.update(edited_parts=edited, connections=metadata, overlap_report=overlap_report)
     sequence_before = state["sequence"]
     st.subheader("なじませながら形状を編集" if all_blend else "② パーツの形状を編集・移動")
+    if controls["source"] == "legacy_all":
+        st.caption("以前の分析結果には操作の選択がないため、全操作を表示しています。要求に必要な操作だけにするには、WSL側を更新してパーツ構成を再作成してください。")
+    else:
+        count = sum(len(spec["parameters"]) for spec in controls["parts"].values())
+        st.caption(f"要求文の分析で選んだ編集操作：{count}個。選択理由は「パーツ構成」で確認できます。")
+        if not count:
+            st.info("この分析結果では編集操作が選択されていません。必要ならパーツ構成を再作成し、近い操作を選び直してください。")
     st.caption("連続した接続にはなじませを適用します。独立部品の接続部は③で延長します。" if policy else
         "移動しても①の蓋を保持します。接続のための移動制限・自動巻き戻しは行いません。接続部の延長は③を押した時に作成します。")
     if motion_ratios and policy is None:
         st.info("断面固定移動を選んでいるパーツがあります。断面を動かして延長を確認する場合は「詳細な形状編集設定 → パーツごとの移動方法」で全体移動を選んでください。")
     event = _component(
         source_key=source_key, parts=editor_payload(parts), scales=state["scales"],
-        editor_protocol=11, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
+        editor_protocol=12, edit_controls=controls, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
         solid_connections=solid_payload,
         boundary_motion=motion, motion_key=repr((motion["method"], sorted(motion_ratios.items()), blend_ids)),
         movement_key=f"{frame_mode}:{sorted(choices.items())}",
@@ -272,7 +286,10 @@ def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None)
         layout_key=f"{NETWORK_FOLLOW_METHOD}:{preferred_pairs}:{bool(follow)}:{bool(show_anchors)}",
         sequence=state["sequence"], up_dir=up_dir, default=None, key=f"part_scale_move_{source_key}",
     )
-    synchronize_editor(state, source_key, parts, event, movement_frames=frames)
+    try:
+        synchronize_editor(state, source_key, parts, event, movement_frames=frames, controls=controls)
+    except ValueError as error:
+        st.error(str(error))
     if state["sequence"] != sequence_before:
         # Return the diagnostics for the newly committed pose to the same iframe.
         st.rerun()

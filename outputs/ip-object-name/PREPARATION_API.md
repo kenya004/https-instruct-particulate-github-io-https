@@ -7,6 +7,27 @@ APIキーは既存の`ip_object_name/local_settings.py`を使用します。
 
 パーツリスト生成と同じLLM応答で、本体・パーツ間の付属関係・接続方式・基準側も推定します。入力は従来どおり物体名と編集要求のテキストだけです。セグメント後の形状分類や、追加のLLM呼び出しは行いません。
 
+同じ応答で、編集要求に必要なパラメータをパーツごとに選びます。候補は`uniform_scale`（一様倍率）、`translate_u`・`translate_v`（接続平面内の移動）、`translate_n`（法線方向の移動）の4種類です。選択結果は`parts[].edit_parameters`、日本語の理由は`parts[].parameter_reason`へ保存します。操作欄がない領域も分割と表示に含め、自動追従のためだけに移動操作を選ばせません。
+
+### 編集パラメータ選択への更新
+
+起動中のAPIを`Ctrl+C`で停止し、次の2ファイルを更新します。依存パッケージとAPIキーの変更はありません。
+
+```bash
+cd ~/git/instruct-particulate
+bundle='/mnt/c/Users/mrkab/Documents/Codex/2026-09-26/https-instruct-particulate-github-io-https/outputs/ip-object-name/ip_object_name'
+cp "$bundle/planning.py" "$bundle/part-plan-system-prompt.md" ip_object_name/
+source .venv/bin/activate
+export IP_OBJECT_NAME_MODEL=gemini-3.8-flash
+export IP_PART_PLANNER_MODEL=gemini-3.8-flash
+export BLENDER_BIN=/usr/bin/blender
+python -m uvicorn ip_object_name.workflow_api:app --host 127.0.0.1 --port 8004 --workers 1
+```
+
+WindowsのStreamlitも再起動し、「パーツ構成を作成」から分析・分割をやり直してください。選択のない旧結果は互換表示として全操作を出し、その旨をUIに表示します。旧結果の読み込み時に新しいLLM呼び出しは行いません。
+
+大きさの変更は一様倍率だけ、平面内移動はU・V、押し引き・食い込み深さの調整はNを選びます。U/V/Nの一方向が指定された場合はその操作だけ、自由な3次元移動を明示した場合は3軸を選びます。方向不明だけを理由に全軸を選ばず、要求と構造から最も近い少数の移動操作を選び、方向の仮定を明記します。完全に対応する操作がない場合も、編集対象には既存の候補から最も近いパラメータを少なくとも一つ選びます。例えば「長さだけ変更」には一様倍率を近似として提示し、太さも同時に変わることを理由と警告に記します。回転や穴あけなどが実装済みであるかのようには説明しません。選択はLLMの意味解釈であり、形状を測定して保証する処理ではありません。3D表示の3軸の矢印は、パラメータ選択とは独立して表示します。
+
 Geminiへ送るスキーマには配列の`minItems`・`maxItems`を含めません。接続情報を追加した大きなスキーマでは、これらが`too many states for serving`の400エラーを起こす場合があるためです。パーツ1～32件・警告10件以下・接続64件以下の条件は指示文で伝え、返答後にPythonで検証します。必須項目・型・接続方式の定義は維持します。
 
 既に配置済みの環境を今回の接続方針に対応させる場合は、起動中のAPIを`Ctrl+C`で停止し、次の3ファイルを更新してから再起動してください。追加の依存パッケージはありません。
@@ -93,6 +114,7 @@ UIの再実行ボタンはこの指定を使います。処理が完了してい
 ## パーツリスト
 
 `parts`の各項目は、0から連番の`part_id`、分割用の英語`name`と`description`、日本語の`label`、編集対象を示す`is_edit_target`を持ちます。
+新しい応答では`edit_parameters`と`parameter_reason`も必須です。`is_edit_target=false`のパーツのリストは空とし、未実装ID・重複・対象外パーツの操作指定をPythonで拒否します。新しい応答で編集対象の操作が空の場合も拒否し、近い候補の選択漏れを成功扱いにしません。旧保存結果の2項目省略・空の操作リストは読み込めます。Geminiへ渡すスキーマにもこの4種類だけを定義し、配列の長さ制限は返答後に検証します。
 `part_names`は分割用名称だけの配列です。物体名・要求文・LLMモデルID・実行IDも結果に含みます。
 `editing_policy`には次の情報を保存し、分割直後・2辺共有補正・CCS補正の`parts.json`にも引き継ぎます。英語のパーツ名を同じプラン内の`part_id`へ変換して保持します。
 
@@ -101,7 +123,7 @@ UIの再実行ボタンはこの指定を使います。処理が完了してい
 | `base_part_id` | 中心となる構造上の本体。リスト順や編集対象の有無だけでは決めない |
 | `relations[].parent_id / child_id` | 構造上の本体・付属側、または連続領域の階層 |
 | `relationship / mode` | `continuous / blend`＝なじませ、`attachment / cap_union`＝閉鎖・延長・Boolean結合 |
-| `reference_part_id / deform_part_id` | この編集で境界の基準となる側と、なじませ・延長する側 |
+| `reference_part_id / deform_part_id` | 閉鎖・延長での基準側と変形側。なじませはWindows側で編集元の各変形量へ適用する |
 | `reason` | 編集要求に基づく日本語の判定理由 |
 
 構造上の本体と、編集で変形する側は別の情報です。本体を編集する要求では本体が変形側になることもあります。同じパーツ間の接続箇所が複数でも意味的な関係は一件とし、既存の共有境界検出で各接続箇所へ適用します。一領域だけの構成は、その領域を本体とし、関係リストを空にします。

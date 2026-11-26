@@ -10,6 +10,7 @@ import { localOffset, setLocalOffset } from "./translation_frames.js";
 import { highlightPositions } from "./overlap_highlights.js";
 import { bindZeroDetent } from "./zero_detent.js";
 import { evaluateConnections } from "./connection_constraints.js";
+import { PARAMETERS, applyParameterVisibility } from "./edit_controls.js";
 
 const viewport = document.getElementById("viewport");
 const sliderList = document.getElementById("sliders");
@@ -37,6 +38,8 @@ let cameraRadius = 0;
 let sceneCenter = new THREE.Vector3();
 let meshes = new Map();
 let widgets = new Map();
+let editControls = null;
+let controlsKey = null;
 let grid = null;
 let partData = [];
 let layout = { connections: [], attachments: [] };
@@ -348,17 +351,20 @@ function refreshOffsetControls(id) {
   }
 }
 
-function commit() {
+function commit(reset = false) {
   if (!sourceKey) return;
   dragging = false;
   sequence += 1;
   Streamlit.setComponentValue({ source_key: sourceKey, sequence, scales: { ...scales },
+    reset: reset === true,
     offsets: Object.fromEntries(Object.entries(offsets).map(([id, value]) => [id, [...value]])) });
 }
 
 function rebuild(args) {
   sourceKey = args.source_key;
   sequence = Number(args.sequence) || 0;
+  editControls = args.edit_controls;
+  controlsKey = args.controls_key;
   scales = { ...args.scales };
   offsets = Object.fromEntries(args.parts.map(part => [String(part.part_id), [...(args.offsets?.[String(part.part_id)] ?? [0, 0, 0])]]));
   movement = args.movement;
@@ -485,7 +491,7 @@ function rebuild(args) {
     motionLabel.textContent = boundaryMotion.parts[id]
       ? `断面固定移動（遷移 ${Math.round(boundaryMotion.parts[id].ratio * 100)}%）` : "全体移動";
     row.appendChild(motionLabel);
-    const moveInputs = [], moveOutputs = [], moveDetents = [];
+    const moveInputs = [], moveOutputs = [], moveDetents = [], moveControls = [];
     for (const [axis, name] of ["X", "Y", "Z"].entries()) {
       const labelName = movementFrames[id].labels[axis];
       const control = document.createElement("div");
@@ -512,11 +518,14 @@ function rebuild(args) {
       moveHeading.append(moveLabel, moveOutput);
       control.append(moveHeading, moveInput);
       row.appendChild(control);
+      moveControls.push(control);
       moveInputs.push(moveInput);
       moveOutputs.push(moveOutput);
     }
     sliderList.appendChild(row);
-    widgets.set(id, { input, output, empty, scaleEndpoints, moveInputs, moveOutputs, moveDetents });
+    const widget = { row, input, output, endpoints, motionLabel, empty, scaleEndpoints, moveControls, moveInputs, moveOutputs, moveDetents };
+    applyParameterVisibility(widget, editControls.parts[id]);
+    widgets.set(id, widget);
     if (!empty && renderer) {
       const center = new THREE.Vector3(...part.center);
       const positions = new Float32Array(part.vertices.length * 3);
@@ -554,6 +563,8 @@ function rebuild(args) {
     updateScale(id, Number(scales[id] ?? 1), false);
     refreshOffsetControls(id);
   }
+  document.getElementById('zero-snap-hint').hidden = !Object.values(editControls.parts)
+    .some(spec => spec.parameters.some(p => p !== 'uniform_scale'));
   if (renderer) {
     const extent = Math.max(bounds.getSize(new THREE.Vector3()).length(), 1e-8);
     sceneExtent = extent;
@@ -603,7 +614,7 @@ document.getElementById("reset").addEventListener("click", () => {
   }
   pendingOverlaps = true;
   updatePreview();
-  commit();
+  commit(true);
 });
 document.getElementById("fit").addEventListener("click", fitView);
 function endPointerDrag() {
@@ -617,7 +628,7 @@ new ResizeObserver(resize).observe(document.getElementById("workspace"));
 Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
   try {
     const args = normalizeEditorArgs(event.detail?.args);
-    if (args.source_key !== sourceKey || args.blending_key !== blendingKey || args.motion_key !== motionKey || args.up_dir !== viewUpDir || args.movement_key !== movementKey) rebuild(args);
+    if (args.source_key !== sourceKey || args.controls_key !== controlsKey || args.blending_key !== blendingKey || args.motion_key !== motionKey || args.up_dir !== viewUpDir || args.movement_key !== movementKey) rebuild(args);
     else {
       const layoutChanged = layoutKey !== args.layout_key;
       layout = args.layout;
@@ -646,8 +657,11 @@ Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
       if (layoutChanged) fitView();
     }
     for (const widget of widgets.values()) {
-      widget.input.disabled = widget.empty || Boolean(event.detail.disabled);
-      for (const input of widget.moveInputs) input.disabled = widget.empty || Boolean(event.detail.disabled) || !args.supports_movement;
+      widget.input.disabled = widget.empty || Boolean(event.detail.disabled) || !widget.parameters.includes('uniform_scale');
+      widget.moveInputs.forEach((input, axis) => {
+        input.disabled = widget.empty || Boolean(event.detail.disabled) || !args.supports_movement
+          || !widget.parameters.includes(PARAMETERS[axis + 1]);
+      });
     }
     const compatibility = document.getElementById("compatibility");
     compatibility.hidden = args.supports_movement;

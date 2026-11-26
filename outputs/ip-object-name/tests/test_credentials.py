@@ -140,9 +140,12 @@ def check_environment(settings):
 
     def test_git_ignores_local_key_but_not_template(self):
         migrate(self.repo, self.bundle)
-        subprocess.run(["git", "init", "--quiet", str(self.repo)], check=True, capture_output=True)
-        secret = subprocess.run(["git", "check-ignore", "ip_object_name/local_settings.py"], cwd=self.repo, capture_output=True)
-        template = subprocess.run(["git", "check-ignore", "ip_object_name/local_settings.example.py"], cwd=self.repo, capture_output=True)
+        # On Windows, patch.dict can restore empty config values in os.environ
+        # while the native environment drops them. Forward the full mapping.
+        environment = os.environ.copy()
+        subprocess.run(["git", "init", "--quiet", str(self.repo)], check=True, capture_output=True, env=environment)
+        secret = subprocess.run(["git", "check-ignore", "ip_object_name/local_settings.py"], cwd=self.repo, capture_output=True, env=environment)
+        template = subprocess.run(["git", "check-ignore", "ip_object_name/local_settings.example.py"], cwd=self.repo, capture_output=True, env=environment)
         self.assertEqual(secret.returncode, 0)
         self.assertEqual(template.returncode, 1)
 

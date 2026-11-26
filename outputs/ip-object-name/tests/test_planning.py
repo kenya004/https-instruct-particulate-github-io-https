@@ -23,8 +23,10 @@ def prediction():
     return PartPlanPrediction.model_validate({
         "summary": "\u6301\u3061\u624b\u3092\u7de8\u96c6\u5bfe\u8c61\u306b\u3057\u307e\u3059\u3002",
         "parts": [
-            {"name": "handle", "label": "\u6301\u3061\u624b", "description": "the gripping region", "is_edit_target": True},
-            {"name": "head", "label": "\u5148\u7aef", "description": "the working region", "is_edit_target": False},
+            {"name": "handle", "label": "\u6301\u3061\u624b", "description": "the gripping region", "is_edit_target": True,
+             "edit_parameters": ["uniform_scale"], "parameter_reason": "全体を大きくするには一様倍率のみを使用します。"},
+            {"name": "head", "label": "\u5148\u7aef", "description": "the working region", "is_edit_target": False,
+             "edit_parameters": [], "parameter_reason": "編集対象ではなく、自動追従だけを使います。"},
         ],
         "warnings": [],
         "base_part": "head",
@@ -78,6 +80,9 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(result["editing_policy"]["base_part_id"], 1)
         self.assertEqual(result["editing_policy"]["relations"][0]["deform_part_id"], 0)
         self.assertEqual([p["part_id"] for p in result["parts"]], [0, 1])
+        self.assertEqual(result["parts"][0]["edit_parameters"], ["uniform_scale"])
+        self.assertEqual(result["parts"][1]["edit_parameters"], [])
+        self.assertTrue(result["parts"][0]["parameter_reason"])
         self.assertEqual(result["input_mesh"], model["input_mesh"])
         self.assertEqual(result["returned_model_version"], "reported-model-version")
         generate.assert_called_once_with("\u30ec\u30f3\u30c1", "Make the handle longer.", model="planning-model")
@@ -161,6 +166,12 @@ class PlanningTests(unittest.TestCase):
         self.assertIn("repositioning the connected parts", prompt)
         self.assertIn("one whole-object region is sufficient", prompt)
         self.assertIn("require downstream geometric validation", prompt)
+        self.assertIn("Evaluate each translation axis independently", prompt)
+        self.assertIn("Select all three translation controls only when the user explicitly requests", prompt)
+        self.assertIn("Do not enable all axes as a fallback", prompt)
+        self.assertIn("Axis visibility is not a reason to select a translation control", prompt)
+        self.assertIn("when none exists, choose the closest available approximation", prompt)
+        self.assertIn("explicitly warn that all three dimensions change together", prompt)
         self.assertEqual(returned_version, "provider-version")
         self.assertEqual(result.parts[0].name, "handle")
 
@@ -177,7 +188,10 @@ class PlanningTests(unittest.TestCase):
             for keyword in ("additional_properties", "additionalProperties", "minItems", "maxItems", "min_items", "max_items"):
                 self.assertNotIn(keyword, json.dumps(schema))
             self.assertEqual(set(schema["required"]), {"summary", "parts", "warnings", "base_part", "connections"})
-            self.assertEqual(set(schema["properties"]["parts"]["items"]["required"]), {"name", "label", "description", "is_edit_target"})
+            self.assertEqual(set(schema["properties"]["parts"]["items"]["required"]),
+                             {"name", "label", "description", "is_edit_target", "edit_parameters", "parameter_reason"})
+            self.assertEqual(schema["properties"]["parts"]["items"]["properties"]["edit_parameters"]["items"]["enum"],
+                             ["uniform_scale", "translate_u", "translate_v", "translate_n"])
             return httpx.Response(200, json={
                 "candidates": [{"content": {"role": "model", "parts": [{"text": prediction().model_dump_json()}]}, "finishReason": "STOP"}],
                 "modelVersion": "test-version",
@@ -269,6 +283,62 @@ class PlanningTests(unittest.TestCase):
         value["parts"] = [value["parts"][0]]
         value.update(base_part="handle", connections=[])
         self.assertEqual(PartPlanPrediction.model_validate(value).editing_policy()["relations"], [])
+
+    def test_parameter_ids_duplicates_and_unedited_controls_are_rejected(self):
+        for parameters, target, reason in ((["length_scale"], True, "長さ"),
+                (["translate_u", "translate_u"], True, "重複"),
+                (["uniform_scale"], False, "対象外"), ([], True, "   ")):
+            with self.subTest(parameters=parameters, target=target):
+                value = prediction().model_dump()
+                value["parts"][0].update(edit_parameters=parameters, is_edit_target=target, parameter_reason=reason)
+                with self.assertRaises(ValidationError):
+                    PartPlanPrediction.model_validate(value)
+
+    def test_new_provider_must_select_controls_but_old_saved_plans_remain_readable(self):
+        value = prediction().model_dump()
+        for part in value["parts"]:
+            del part["edit_parameters"], part["parameter_reason"]
+        old = PartPlanPrediction.model_validate(value)
+        self.assertIsNone(old.parts[0].edit_parameters)
+        client = MagicMock()
+        client.models.generate_content.return_value = SimpleNamespace(text=json.dumps(value))
+        with patch("google.genai.Client") as constructor, patch("ip_object_name.core._api_key", return_value="test-key"):
+            constructor.return_value.__enter__.return_value = client
+            with self.assertRaises(core.VLMError):
+                request_part_plan("wrench", "edit", model="selected-model")
+        client.models.generate_content.assert_called_once()
+
+    def test_supported_subset_and_approximation_have_explicit_reasons(self):
+        value = prediction().model_dump()
+        value["parts"][0].update(edit_parameters=["translate_u", "translate_v"], parameter_reason="接続面内の移動には2方向を使用します。")
+        result = PartPlanPrediction.model_validate(value)
+        self.assertEqual(result.parts[0].edit_parameters, ["translate_u", "translate_v"])
+        value["parts"][0].update(edit_parameters=["uniform_scale"],
+            parameter_reason="一様倍率で長さの変更を近似します。長さ以外の寸法も変化します。")
+        value["warnings"] = ["長さだけは変えられず、太さも同時に変わります。"]
+        client = MagicMock()
+        client.models.generate_content.return_value = SimpleNamespace(text=json.dumps(value))
+        with patch("google.genai.Client") as constructor, patch("ip_object_name.core._api_key", return_value="test-key"):
+            constructor.return_value.__enter__.return_value = client
+            result, _ = request_part_plan("wrench", "Make only the handle longer.", model="selected-model")
+        self.assertEqual(result.parts[0].edit_parameters, ["uniform_scale"])
+        self.assertIn("近似", result.parts[0].parameter_reason)
+        self.assertEqual(result.warnings, value["warnings"])
+        self.assertEqual(result.parts[1].edit_parameters, [])
+        client.models.generate_content.assert_called_once()
+
+    def test_new_provider_cannot_leave_edit_targets_empty_but_saved_results_remain_readable(self):
+        value = prediction().model_dump()
+        value["parts"][0].update(edit_parameters=[], parameter_reason="以前の未対応判定")
+        self.assertEqual(PartPlanPrediction.model_validate(value).parts[0].edit_parameters, [])
+        client = MagicMock()
+        client.models.generate_content.return_value = SimpleNamespace(text=json.dumps(value))
+        with patch("google.genai.Client") as constructor, patch("ip_object_name.core._api_key", return_value="test-key"):
+            constructor.return_value.__enter__.return_value = client
+            with self.assertRaises(core.VLMError) as caught:
+                request_part_plan("wrench", "Make the handle longer.", model="selected-model")
+        self.assertIn("closest available control", str(caught.exception.__cause__))
+        client.models.generate_content.assert_called_once()
 
 
 if __name__ == "__main__":
