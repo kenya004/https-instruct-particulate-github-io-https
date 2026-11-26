@@ -8,14 +8,15 @@ from streamlit.components.v1 import declare_component
 
 from editing import editor_payload, editor_source_key, export_edited_glb, load_editable_parts, scale_parts, synchronize_editor, translation_controls
 from connections import build_connection_plan, connection_payload, connection_residuals, detect_connections, follow_connections
-from boundary_blending import apply_boundary_blend, blend_metadata, blended_anchor_residuals, build_boundary_blend
-from boundary_motion import apply_boundary_motion, build_motion_distances, motion_metadata, motion_weights
+from boundary_blending import DEFAULT_RATIO, METHOD as BLEND_METHOD, apply_boundary_blend, blend_metadata, blended_anchor_residuals, build_blend_distances, blend_weights
+from boundary_motion import METHOD as MOTION_METHOD, apply_boundary_motion, build_motion_distances, motion_metadata, motion_weights, motion_from_blending
 from movement_axes import build_movement_frames
 from mesh_overlaps import METHOD as OVERLAP_METHOD, assemble_parts, find_face_overlaps, only_new_overlaps, overlap_frame, part_face_ids
 from rejoining import export_rejoined_glb, export_rejoined_npz, has_rejoin_data, rejoin_input_key, rejoin_parts, rejoined_payload
 from viewer import mesh_figure, mesh_viewer_config
 from capping_panel import render_capping
-from solid_panel import closed_editor_payload, render_closure_stage, render_solid_result
+from solid_panel import closed_editor_payload, render_closure_stage, render_solid_result, render_blended_result
+from editing_policy import render_policy, connection_settings
 
 
 _component_directory = Path(__file__).with_name("scale_component") / "dist"
@@ -31,10 +32,18 @@ def _load(content: bytes, manifest: dict, topology_version=2):
     return parts, connections, warnings, has_rejoin_data(content, manifest)
 
 
-@st.cache_data(show_spinner=False, max_entries=12)
-def _load_blending(content, manifest, selected_ids, ratio, root_id):
+@st.cache_data(show_spinner=False, max_entries=6)
+def _load_blend_distances(content, manifest, selected_ids, root_id, connection_ids=None, references=(), range_method=BLEND_METHOD):
     parts, connections, _, _ = _load(content, manifest, 2)
-    return build_boundary_blend(content, manifest, parts, connections, selected_ids, ratio, root_id)
+    if connection_ids is not None:
+        connections = tuple(c for c in connections if c.connection_id in connection_ids)
+    return build_blend_distances(content, manifest, parts, connections, selected_ids, root_id, dict(references))
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def _load_blending(content, manifest, selected_ids, ratio, root_id, connection_ids=None, references=(), range_method=BLEND_METHOD):
+    fields = _load_blend_distances(content, manifest, selected_ids, root_id, connection_ids, references, range_method)
+    return blend_weights(fields, ratio)
 
 
 @st.cache_data(show_spinner=False, max_entries=12)
@@ -44,14 +53,16 @@ def _load_frames(content, manifest, up_dir, selected, enabled):
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
-def _load_motion_distances(content, manifest):
+def _load_motion_distances(content, manifest, connection_ids=None, range_method=MOTION_METHOD, selected_ids=None):
     parts, connections, _, _ = _load(content, manifest, 2)
-    return build_motion_distances(content, manifest, parts, connections)
+    if connection_ids is not None:
+        connections = tuple(c for c in connections if c.connection_id in connection_ids)
+    return build_motion_distances(content, manifest, parts, connections, selected_ids)
 
 
 @st.cache_data(show_spinner=False, max_entries=12)
-def _load_motion(content, manifest, ratios):
-    distances = _load_motion_distances(content, manifest) if ratios else {"parts": {}, "anchors": {}}
+def _load_motion(content, manifest, ratios, connection_ids=None, range_method=MOTION_METHOD):
+    distances = _load_motion_distances(content, manifest, connection_ids, range_method, tuple(i for i, _ in ratios)) if ratios else {"parts": {}, "anchors": {}}
     return motion_weights(distances, dict(ratios))
 
 
@@ -85,54 +96,66 @@ def _reference_overlaps(content, manifest, method):
     return report, source_face_ids
 
 
-def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
+def render_part_editor(result: dict, content: bytes, up_dir: str, analysis=None) -> None:
     parts, connections, warnings, can_rejoin = _load(content, result, 2)
     source_key = editor_source_key(result, content)
     state = st.session_state.setdefault("part_editing", {})
     synchronize_editor(state, source_key, parts)
     available = [part.part_id for part in parts if len(part.faces)]
     names = {part.part_id: part.name for part in parts}
+    policy = render_policy(result, analysis, parts, connections, source_key)
+    auto_selected, blend_references, blend_ids = connection_settings(policy, connections)
     root_id = st.selectbox("基準パーツ（拡大縮小の位置を固定）", available,
                            format_func=lambda index: f"{names[index]} (ID {index})", key=f"connection_root_{source_key}")
     with st.expander("詳細な形状編集設定"):
         follow = st.checkbox("接続位置に追従", value=True, disabled=not connections, key=f"connection_follow_{source_key}")
         show_anchors = st.checkbox("接続点を表示", value=True, disabled=not connections, key=f"connection_points_{source_key}")
-        plan = build_connection_plan(parts, connections, root_id)
+        plan = build_connection_plan(parts, connections, root_id, preferred_relations=policy["relations"] if policy else ())
         layout = connection_payload(plan)
         for warning in warnings:
             st.warning(warning)
         if connections:
             st.caption(f"接続領域：{len(connections)} / 追従に使用：{len(plan.attachments) if follow else 0}。緑の点は位置の一致、橙の点と線はずれを表します。")
-            st.caption("拡大縮小に伴う接続位置へ追従します。移動操作で境界を残す場合は、下の移動方法から断面固定移動を選んでください。")
+            st.caption("拡大縮小に伴う接続位置へ追従します。なじませる接続は、移動時も基準側へ境界を合わせます。" if policy else
+                "拡大縮小に伴う接続位置へ追従します。移動操作で境界を残す場合は、下の移動方法から断面固定移動を選んでください。")
             if plan.unused_ids:
-                st.warning("輪状の接続または同じパーツ間の複数接続があります。境界の長い接続を優先して追従し、使わない接続のずれも表示します。")
+                st.warning("輪状の接続または同じパーツ間の複数接続があります。平行移動の追従には境界の長い接続を優先します。なじませは指定されたすべての接続境界に適用します。")
             if len(plan.roots) > 1:
                 st.caption("基準パーツにつながらないグループは、それぞれID最小の非空パーツの位置を固定します。")
         elif len(available) > 1:
             st.info("共有境界を検出できませんでした。離れたメッシュや頂点位置の異なる境界には、自動で接続を作りません。")
         connected_ids = {index for item in connections for index in (item.part_a, item.part_b)}
-        selected = st.multiselect("境界なじませを適用するパーツ", [index for index in available if index in connected_ids] if can_rejoin else [],
-                                 format_func=lambda index: f"{names[index]} (ID {index})", key=f"boundary_blend_parts_{source_key}")
-        percent = st.slider("境界なじませの範囲（%）", 1, 100, 20, disabled=not selected, key=f"boundary_blend_range_{source_key}")
-        st.caption("選択したパーツの境界を接続先に合わせ、内部へ向かって指定倍率に戻します。範囲は境界から最奥までのメッシュに沿った距離に対する割合です。手動XYZ移動は最後に加えます。")
-        with st.spinner("境界からの距離を計算しています"):
-            blending = _load_blending(content, result, tuple(sorted(selected)), percent / 100, root_id)
+        if policy is None:
+            selected = st.multiselect("境界なじませを適用するパーツ", [index for index in available if index in connected_ids] if can_rejoin else [],
+                                     format_func=lambda index: f"{names[index]} (ID {index})", key=f"boundary_blend_parts_{source_key}")
+        else:
+            selected = list(auto_selected)
+            st.caption("なじませの自動対象：" + (", ".join(names[i] for i in selected) or "なし"))
+        percent = st.slider("境界なじませの範囲（%）", 1, 100, int(DEFAULT_RATIO * 100), disabled=not selected, key=f"boundary_blend_range_{source_key}")
+        st.caption("断面を接続先に合わせ、本体の表面から離れるほど指定倍率を適用します。距離は編集前の接続先の三角形表面まで測り、一度計算して再利用します。幅は元のパーツを囲むBoxの最長辺に対する割合で、初期値60%です。")
+        with st.spinner("接続先の表面までの距離と重みを準備しています"):
+            blending = _load_blending(content, result, tuple(sorted(selected)), percent / 100, root_id,
+                blend_ids if policy else None, blend_references, BLEND_METHOD)
         for warning in blending["warnings"]:
             st.warning(warning)
         motion_ratios = {}
-        with st.expander("パーツごとの移動方法"):
-            for part in parts:
-                enabled = can_rejoin and part.part_id in connected_ids and bool(len(part.faces))
-                mode = st.selectbox(f"{part.name} の移動方法", ["全体移動", "断面固定移動"], disabled=not enabled,
-                                    key=f"boundary_motion_mode_{source_key}_{part.part_id}")
-                fixed = enabled and mode == "断面固定移動"
-                band = st.slider(f"{part.name} の遷移範囲（%）", 1, 100, 20, disabled=not fixed,
-                                 key=f"boundary_motion_range_{source_key}_{part.part_id}")
-                if fixed:
-                    motion_ratios[part.part_id] = band / 100
-            st.caption("断面固定移動は、移動前のすべての共有境界を固定し、メッシュに沿った距離に応じて指定移動量へ滑らかに近づけます。範囲は境界から最奥までの距離に対する割合です。")
+        if policy:
+            motion_ratios = {part_id: percent / 100 for part_id in selected}
+            st.caption("なじませる接続では、倍率と同じ遷移範囲で移動量も調整します。閉鎖して再結合する断面は自由に移動します。")
+        else:
+            with st.expander("パーツごとの移動方法"):
+                for part in parts:
+                    enabled = can_rejoin and part.part_id in connected_ids and bool(len(part.faces))
+                    mode = st.selectbox(f"{part.name} の移動方法", ["全体移動", "断面固定移動"], disabled=not enabled,
+                                        key=f"boundary_motion_mode_{source_key}_{part.part_id}")
+                    fixed = enabled and mode == "断面固定移動"
+                    band = st.slider(f"{part.name} の遷移範囲（%）", 1, 100, int(DEFAULT_RATIO * 100), disabled=not fixed,
+                                     key=f"boundary_motion_range_{source_key}_{part.part_id}")
+                    if fixed:
+                        motion_ratios[part.part_id] = band / 100
+                st.caption("断面固定移動は、移動前のすべての共有境界を固定し、接続先の表面から離れるほど指定移動量へ滑らかに近づけます。幅は元のパーツを囲むBoxの最長辺に対する割合で、初期値60%です。")
         with st.spinner("断面固定移動の重みを準備しています"):
-            motion = _load_motion(content, result, tuple(sorted(motion_ratios.items())))
+            motion = motion_from_blending(blending) if policy else _load_motion(content, result, tuple(sorted(motion_ratios.items())), range_method=MOTION_METHOD)
         for warning in motion["warnings"]:
             st.warning(warning)
         frame_mode = st.selectbox("移動方向の基準", ["断面の近似平面", "入力XYZ"], key=f"movement_mode_{source_key}")
@@ -184,8 +207,17 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
                 "translations": {str(index): value.tolist() for index, value in translations.items()},
                 "anchor_residuals": {str(index): value for index, value in residuals.items()},
                 "boundary_blending": blend_info, "movement_frames": frames, "boundary_motion": motion_metadata(motion)}
-    closed_snapshot, solid_settings = render_closure_stage(
-        state, result, content, parts, baseline, metadata, up_dir, can_rejoin)
+    if policy:
+        metadata["editing_policy"] = {**policy, "base_part_id": root_id}
+    all_blend = bool(policy and policy["relations"] and all(r["mode"] == "blend" for r in policy["relations"]))
+    if all_blend:
+        closed_snapshot, solid_settings = None, {}
+        state.pop("solid_extension", None)
+        state.pop("solid_union", None)
+    else:
+        state.pop("blend_joined", None)
+        closed_snapshot, solid_settings = render_closure_stage(
+            state, result, content, parts, baseline, metadata, up_dir, can_rejoin)
     solid_payload = closed_editor_payload(closed_snapshot, source_key)
     overlap_report, overlap_faces = None, {}
     reference_report, reference_face_ids = None, None
@@ -202,17 +234,18 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         st.caption(f"新しく重なるFace：{count}面 / {overlap_report['pair_count']}組。未編集時の交差ペアは表示から除外しています。")
     state.update(edited_parts=edited, connections=metadata, overlap_report=overlap_report)
     sequence_before = state["sequence"]
-    st.subheader("② 閉じたパーツを移動")
-    st.caption("移動しても①の蓋を保持します。接続のための移動制限・自動巻き戻しは行いません。接続部の延長は③を押した時に作成します。")
-    if motion_ratios:
+    st.subheader("なじませながら形状を編集" if all_blend else "② パーツの形状を編集・移動")
+    st.caption("連続した接続にはなじませを適用します。独立部品の接続部は③で延長します。" if policy else
+        "移動しても①の蓋を保持します。接続のための移動制限・自動巻き戻しは行いません。接続部の延長は③を押した時に作成します。")
+    if motion_ratios and policy is None:
         st.info("断面固定移動を選んでいるパーツがあります。断面を動かして延長を確認する場合は「詳細な形状編集設定 → パーツごとの移動方法」で全体移動を選んでください。")
     event = _component(
         source_key=source_key, parts=editor_payload(parts), scales=state["scales"],
         editor_protocol=8, blending=blending, movement_frames=frames, show_movement_axes=show_axes,
         solid_connections=solid_payload,
-        boundary_motion=motion, motion_key=repr(sorted(motion_ratios.items())),
+        boundary_motion=motion, motion_key=repr((MOTION_METHOD, sorted(motion_ratios.items()), blend_ids, blend_references)),
         movement_key=f"{frame_mode}:{sorted(choices.items())}",
-        blending_key=f"{root_id}:{sorted(selected)}:{percent}",
+        blending_key=f"{BLEND_METHOD}:{root_id}:{sorted(selected)}:{percent}:{blend_references}",
         offsets=state["offsets"], movement=movement, show_overlaps=show_overlaps, overlap_faces=overlap_faces,
         overlap_status=(f"新しく重なるFace：{len(overlap_report['face_ids'])}面 / {overlap_report['pair_count']}組" if overlap_report else "重なり表示はオフです"),
         layout=layout, follow=bool(follow and connections), show_anchors=bool(show_anchors and connections),
@@ -234,6 +267,9 @@ def render_part_editor(result: dict, content: bytes, up_dir: str) -> None:
         file_name=f"{result['segmentation_id']}_scaled.glb", mime="model/gltf-binary", icon=":material/download:", key="download_edited_glb",
     )
     revision = rejoin_input_key(source_key, state["scales"], metadata)
+    if all_blend:
+        render_blended_result(state, result, content, parts, edited, revision, metadata, up_dir)
+        return
     render_solid_result(state, result, content, parts, plan, solid_settings, closed_snapshot, motion, revision, metadata, up_dir)
     with st.expander("従来の閉鎖・再結合を比較（詳細）"):
         render_capping(state, content, result, parts, edited, revision, metadata, up_dir, can_rejoin)

@@ -8,7 +8,7 @@ const vertices = {}, anchors = {}, byId = new Map(args.parts.map(part => [part.p
 for (const part of args.parts) {
   if (!part.center) continue;
   const id = String(part.part_id), output = new Float32Array(part.vertices.length * 3);
-  writeBlendedPositions(part, transforms, args.blending.parts[id] ?? {influences: []}, output, args.offsets[id], motion.parts[id]);
+  writeBlendedPositions(part, transforms, args.blending.parts[id] ?? {influences: []}, output, args.offsets[id], motion.parts[id], args.offsets);
   vertices[id] = part.vertices.map((_, index) => part.center.map((value, axis) => value + output[index * 3 + axis]));
 }
 for (const [id, samples] of Object.entries(motion.anchors)) {

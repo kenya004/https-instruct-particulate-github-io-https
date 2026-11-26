@@ -1,16 +1,18 @@
 """Explicit closure, free movement, extension, and Boolean output stages."""
 import hashlib
 import json
+from dataclasses import replace
 
 import numpy as np
 import streamlit as st
 
-from boolean_union import export_union_glb, export_union_npz, export_union_stl, union_parts, union_payload
+from boolean_union import UnionResult, export_union_glb, export_union_npz, export_union_stl, union_parts, union_payload, validate_solid
 from capping import METHOD as CAP_METHOD, TRIANGULATIONS, cap_parts, capped_payloads, export_capped_glb, export_capped_npz
 from connection_overlap import (METHOD, closed_context, connections_from_closed, constraint_payload,
                                 diagnose_extension, evaluate_connections, extend_closed, pose_closed, reports_valid)
 from mesh_overlaps import METHOD as OVERLAP_METHOD
 from viewer import mesh_figure, mesh_viewer_config
+from rejoining import rejoin_parts, rejoined_payload, export_rejoined_glb, export_rejoined_npz
 
 
 def _discard_extension(state):
@@ -143,9 +145,27 @@ def render_solid_result(state, manifest, content, original, plan, settings, snap
         state["solid_extension"] = saved
         try:
             with st.spinner("移動後の断面から延長方向と長さを調べています"):
+                policy = metadata.get("editing_policy")
                 context = connections_from_closed(content, manifest, original, snapshot["result"], plan,
-                                                  depth_ratio=settings["depth_ratio"], allow_intersections=True)
-                reports = evaluate_connections(context, posed, strict=False)
+                    depth_ratio=settings["depth_ratio"], allow_intersections=True,
+                    role_overrides=policy["relations"] if policy else ())
+                if policy:
+                    modes = {frozenset((r["parent_id"], r["child_id"])): r["mode"] for r in policy["relations"]}
+                    attached = [r for r in context.regions if modes.get(frozenset((r["parent_id"], r["child_id"]))) != "blend"]
+                    reports = evaluate_connections(replace(context, regions=attached), posed, strict=False)
+                    by_id = {r.part.part_id: r.part for r in posed.parts}
+                    for region in context.regions:
+                        if region in attached:
+                            continue
+                        pairs = np.asarray(region["pairs"])
+                        valid = bool(np.max(np.linalg.norm(by_id[region["child_id"]].vertices[pairs[:, 0]] -
+                            by_id[region["parent_id"]].vertices[pairs[:, 1]], axis=1)) <= context.frame["scale"] * 1e-9)
+                        reports.append({"connection_ids": region["connection_ids"], "parent_id": region["parent_id"],
+                            "child_id": region["child_id"], "cap_id": region["cap_id"], "mode": "blend",
+                            "valid": valid, "status": "contact" if valid else "blocked", "length": 0., "depth": 0.,
+                            "normal": region["normal"], "reason": "なじませる境界が一致していません。基準側と編集側を確認してください。"})
+                else:
+                    reports = evaluate_connections(context, posed, strict=False)
                 saved["reports"] = reports
                 result = extend_closed(context, posed, [r for r in reports if r["valid"]], validate_self=False)
                 saved.update(result=result, complete=reports_valid(reports))
@@ -230,3 +250,56 @@ def render_solid_result(state, manifest, content, original, plan, settings, snap
     else:
         st.download_button("印刷用 STL", union["stl"], file_name=f"{manifest['segmentation_id']}_union_mm.stl",
                            mime="model/stl", key="download_union_stl")
+
+
+def render_blended_result(state, manifest, content, original, edited, revision, metadata, up_dir):
+    """Continuous-only models use matched source vertices, with no extrusion."""
+    st.subheader("なじませによる接続")
+    st.caption("なじませを反映した境界の対応頂点を結合します。倍率・移動を変えたら一体化を押し直してください。")
+    if state.get("blend_joined", {}).get("input_key") != revision:
+        state.pop("blend_joined", None)
+    if st.button("なじませて一体化", key="blend_join"):
+        state.pop("blend_joined", None)
+        try:
+            joined = rejoin_parts(content, manifest, original, edited)
+            state["blend_joined"] = {"input_key": revision, "result": joined,
+                "glb": export_rejoined_glb(joined, source_key=state["source_key"], editing_metadata=metadata),
+                "npz": export_rejoined_npz(joined, editing_metadata=metadata)}
+        except Exception as error:
+            st.error(f"境界を結合できません：{error}")
+    if "blend_joined" not in state:
+        return
+    saved = state["blend_joined"]
+    joined = saved["result"]
+    st.plotly_chart(mesh_figure([rejoined_payload(joined)], up_dir=up_dir), width="stretch",
+        key=f"blend_joined_plot_{state['source_key']}_{up_dir}", config=mesh_viewer_config())
+    st.download_button("結合したモデル GLB", saved["glb"],
+        file_name=f"{manifest['segmentation_id']}_blended.glb", mime="model/gltf-binary", key="download_blend_glb")
+    st.download_button("結合したモデル NPZ", saved["npz"],
+        file_name=f"{manifest['segmentation_id']}_blended.npz", key="download_blend_npz")
+    factor = st.number_input("STL出力：1座標単位を何mmにするか", min_value=.000001, max_value=1000000.,
+        value=1., format="%.6f", key=f"stl_mm_{state['source_key']}")
+    if "validation" not in saved and "validation_error" not in saved:
+        try:
+            if joined.statistics["bridge_faces"]:
+                raise ValueError("なじませる境界が一致していません。接続先の設定を確認してください。")
+            saved["validation"] = validate_solid(joined.mesh.vertices, joined.mesh.faces)
+            if saved["validation"]["connected_components"] != 1:
+                raise ValueError("分離した立体が残っています。")
+        except ValueError as error:
+            saved["validation_error"] = str(error)
+    if saved.get("validation_error"):
+        st.warning(f"STL出力を保留しています：{saved['validation_error']}")
+        return
+    if saved.get("stl_factor") != factor:
+        try:
+            result = UnionResult(joined.mesh, joined.face_part_ids, joined.source_face_indices,
+                np.zeros(len(joined.mesh.faces), dtype=np.int64), saved["validation"], {p.part_id:p.color for p in original})
+            saved.update(stl_factor=factor, stl=export_union_stl(result, mm_per_unit=factor), stl_error=None)
+        except ValueError as error:
+            saved.update(stl_factor=factor, stl=None, stl_error=str(error))
+    if saved.get("stl_error"):
+        st.warning(f"STL出力を保留しています：{saved['stl_error']}")
+    else:
+        st.download_button("印刷用 STL", saved["stl"], file_name=f"{manifest['segmentation_id']}_blended_mm.stl",
+            mime="model/stl", key="download_blend_stl")

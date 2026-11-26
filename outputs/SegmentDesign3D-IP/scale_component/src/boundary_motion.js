@@ -10,10 +10,12 @@ export function normalizeBoundaryMotion(value, parts) {
     const part = byId.get(id);
     if (!part?.center || !Array.isArray(spec?.weights) || spec.weights.length !== part.vertices.length
         || !spec.weights.every(weight => typeof weight === 'number' && Number.isFinite(weight) && weight >= 0 && weight <= 1)) fail();
-    const ratio = spec.ratio ?? .2;
+    const ratio = spec.ratio ?? .6;
     if (typeof ratio !== 'number' || !Number.isFinite(ratio) || ratio <= 0 || ratio > 1) fail();
     specs[id] = {...spec, ratio};
   }
   const {anchors} = normalizeBlending({anchors: value.anchors}, parts);
+  normalizeBlending({parts: Object.fromEntries(Object.entries(specs).map(([id, spec]) =>
+    [id, {influences: spec.reference_influences ?? []}]))}, parts);
   return {...value, parts: specs, anchors};
 }

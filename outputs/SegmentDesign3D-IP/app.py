@@ -21,7 +21,7 @@ if getattr(editing, "EDITING_PROTOCOL", 0) < 2:
     importlib.reload(editing)
 if "boundary_edges" not in connections.Connection.__dataclass_fields__:
     importlib.reload(connections)
-refresh_ui_modules(names=("connections", "workflow", "orientation", "movement_axes", "boundary_blending", "boundary_motion", "rejoining", "mesh_overlaps", "viewer", "capping", "capping_panel", "part_editor"))
+refresh_ui_modules(names=("connections", "workflow", "orientation", "movement_axes", "boundary_blending", "boundary_motion", "rejoining", "mesh_overlaps", "viewer", "capping", "capping_panel", "connection_overlap", "boolean_union", "editing_policy", "solid_panel", "part_editor"))
 
 from backend_client import BackendClient, BackendError
 from orientation import aligned_mesh_payloads
@@ -143,6 +143,11 @@ if plan:
         for part in plan["parts"]
     ]
     st.dataframe(rows, hide_index=True, width="stretch")
+    if plan.get("editing_policy"):
+        from editing_policy import policy_rows
+        names = {p["part_id"]: p["name"] for p in plan["parts"]}
+        st.caption("推定された本体：" + names[plan["editing_policy"]["base_part_id"]])
+        st.dataframe(policy_rows(plan["editing_policy"], names), hide_index=True, width="stretch")
     for warning in plan.get("warnings", []):
         st.warning(warning)
     with download:
@@ -297,7 +302,7 @@ if plan:
             st.subheader("パーツ編集")
             st.caption("各パーツの倍率と3方向の移動量を編集します。倍率1.00・移動量0が元の形状です。")
             try:
-                render_part_editor(result, artifacts["parts.npz"], display_up_dir)
+                render_part_editor(result, artifacts["parts.npz"], display_up_dir, analysis=plan)
                 editor_present = True
             except Exception as error:
                 st.error(f"編集データを読み込めません：{error}")

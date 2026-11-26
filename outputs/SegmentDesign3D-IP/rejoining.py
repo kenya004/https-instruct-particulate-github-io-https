@@ -35,7 +35,8 @@ def has_rejoin_data(content: bytes, manifest: dict) -> bool:
 def rejoin_input_key(source_key: str, scales: dict, connections: dict) -> str:
     settings = {"source": source_key, "scales": scales, "root": connections["root_id"],
                 "follow": connections["enabled"], "translations": connections["translations"],
-                "boundary_blending": connections.get("boundary_blending"), "boundary_motion": connections.get("boundary_motion")}
+                "boundary_blending": connections.get("boundary_blending"), "boundary_motion": connections.get("boundary_motion"),
+                "editing_policy": connections.get("editing_policy")}
     return hashlib.sha256(json.dumps(settings, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
@@ -197,15 +198,16 @@ def rejoined_payload(joined: RejoinedMesh) -> dict:
             "color": "#e28b3e", "face_colors": [joined.palette[int(index)] for index in joined.face_part_ids]}
 
 
-def export_rejoined_npz(joined: RejoinedMesh) -> bytes:
+def export_rejoined_npz(joined: RejoinedMesh, *, editing_metadata=None) -> bytes:
     buffer = io.BytesIO()
+    metadata = {} if editing_metadata is None else {"metadata_json": np.asarray(json.dumps(editing_metadata, ensure_ascii=False, allow_nan=False))}
     np.savez_compressed(buffer, vertices=joined.mesh.vertices, faces=joined.mesh.faces,
                         face_part_ids=joined.face_part_ids, face_colors=joined.mesh.visual.face_colors,
-                        source_face_indices=joined.source_face_indices, is_bridge=joined.is_bridge)
+                        source_face_indices=joined.source_face_indices, is_bridge=joined.is_bridge, **metadata)
     return buffer.getvalue()
 
 
-def export_rejoined_glb(joined: RejoinedMesh, *, source_key: str) -> bytes:
+def export_rejoined_glb(joined: RejoinedMesh, *, source_key: str, editing_metadata=None) -> bytes:
     """One glTF mesh/node, with shared positions and separate material groups.
 
     glTF has vertex colors, not face colors. Material groups retain sharp face colors
@@ -215,6 +217,8 @@ def export_rejoined_glb(joined: RejoinedMesh, *, source_key: str) -> bytes:
             "scenes": [{"nodes": [0]}], "nodes": [{"name": "rejoined_mesh", "mesh": 0}],
             "meshes": [], "materials": [], "accessors": [], "bufferViews": [],
             "extras": {"editor_source_key": source_key, "rejoining": joined.statistics}}
+    if editing_metadata is not None:
+        tree["extras"]["editing"] = editing_metadata
     binary = bytearray()
 
     def accessor(array, component_type, kind, target, bounds=False):

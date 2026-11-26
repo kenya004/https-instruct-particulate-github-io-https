@@ -105,6 +105,20 @@ class SegmentationTests(unittest.TestCase):
         saved = json.loads((self.folder / "segmentation.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["segmentation_id"], second["segmentation_id"])
 
+    def test_editing_policy_is_retained_by_initial_and_refined_partition_exports(self):
+        policy = {"version": 1, "source": "part_planner_text", "base_part_id": 1, "relations": [
+            {"parent_id": 1, "child_id": 0, "reference_part_id": 1, "deform_part_id": 0,
+             "relationship": "attachment", "mode": "cap_union", "reason": "独立した編集領域"}]}
+        self.plan["editing_policy"] = policy
+        write_json(self.folder / "part_plan.json", self.plan)
+        result = self.segment()
+        self.assertEqual(result["editing_policy"], policy)
+        self.assertEqual(self.client.get(result["files"]["parts.json"]).json()["editing_policy"], policy)
+        # Boundary and CCS refinements share this export function and plan.
+        refined = export_partition(self.partition, self.plan, self.root / "refined", "d" * 32)
+        self.assertEqual(refined["editing_policy"], policy)
+        self.assertEqual(json.loads((self.root / "refined" / "parts.json").read_text(encoding="utf-8"))["editing_policy"], policy)
+
     def test_connectivity_defaults_on_and_can_be_disabled(self):
         self.assertTrue(SegmentationOptions().enforce_connectivity_per_part)
         result = self.segment()

@@ -297,7 +297,7 @@ function deform(state, args, scales, offsets) {
   for (const [id, entry] of state.entries) {
     const { source, spec, positions, local } = entry;
     writeBlendedPositions(source, transforms, args.blending?.parts?.[id] ?? { influences: [] }, local,
-      offsets[id] ?? [0, 0, 0], args.boundary_motion?.parts?.[id]);
+      offsets[id] ?? [0, 0, 0], args.boundary_motion?.parts?.[id], offsets);
     let changed = false;
     entry.maxCoordinate = 1;
     for (let i = 0; i < local.length; i += 1) {

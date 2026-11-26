@@ -54,7 +54,9 @@ class BoundaryMotionTests(unittest.TestCase):
         edited = apply_boundary_motion(parts, offsets, field)
         seam = np.isclose(parts[1].vertices[:, 0], 11) | np.isclose(parts[1].vertices[:, 0], 21)
         middle = np.isclose(parts[1].vertices[:, 0], 16)
-        halfway = np.isclose(parts[1].vertices[:, 0], 11.5)
+        halfway = np.isclose(parts[1].vertices[:, 0], 12) | np.isclose(parts[1].vertices[:, 0], 20)
+        self.assertAlmostEqual(field["parts"]["1"]["radius"], 2)
+        self.assertAlmostEqual(field["parts"]["1"]["part_size"], 10)
         np.testing.assert_array_equal(edited[1].vertices[seam], parts[1].vertices[seam])
         np.testing.assert_allclose(edited[1].vertices[middle], parts[1].vertices[middle] + [0, 2, 0])
         np.testing.assert_allclose(edited[1].vertices[halfway], parts[1].vertices[halfway] + [0, 1, 0])
@@ -142,7 +144,7 @@ class BoundaryMotionInterfaceTests(unittest.TestCase):
         state = app.session_state["part_editing"]; key = state["source_key"]
         mode_key, range_key = f"boundary_motion_mode_{key}_1", f"boundary_motion_range_{key}_1"
         self.assertEqual(app.selectbox(key=mode_key).value, "全体移動")
-        self.assertEqual(app.slider(key=range_key).value, 20)
+        self.assertEqual(app.slider(key=range_key).value, 60)
         self.assertTrue(app.slider(key=range_key).disabled)
         app.selectbox(key=mode_key).set_value("断面固定移動").run()
         self.assertFalse(app.slider(key=range_key).disabled)

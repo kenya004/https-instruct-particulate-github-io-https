@@ -7,8 +7,20 @@ from collections import defaultdict
 from dataclasses import replace
 
 import numpy as np
+import trimesh
 
 from editing import validate_scales
+
+
+METHOD = "reference_surface_blend_v3"
+DISTANCE_BASIS = "reference_triangle_surface"
+RANGE_BASIS = "part_aabb_longest_side"
+DEFAULT_RATIO = .6
+
+
+def part_transition_size(part):
+    """Use the longest side of the original part's AABB for every cut."""
+    return float(np.ptp(part.vertices, axis=0).max()) if len(part.vertices) else 0.
 
 
 def _distances(graph, seeds, limit=float("inf")):
@@ -75,6 +87,98 @@ def part_edge_graph(points, source_ids, part):
     return node_for_local, node_index, graph
 
 
+class _SurfaceDistanceQuery:
+    """Reuse a reference mesh's spatial index, in a scale-independent frame."""
+
+    def __init__(self, part):
+        lower, upper = part.vertices.min(axis=0), part.vertices.max(axis=0)
+        self.origin = lower + (upper - lower) / 2
+        self.scale = float((upper - lower).max())
+        if not np.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError(f"{part.name}: 接続先の表面距離を計算できません。")
+        vertices = (part.vertices - self.origin) / self.scale
+        triangles = vertices[part.faces]
+        # Degenerate faces have no surface area. Skip them in the query only;
+        # the input geometry and exported faces remain untouched.
+        normal = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+        faces = part.faces[np.any(normal != 0, axis=1)]
+        if not len(faces):
+            raise ValueError(f"{part.name}: 距離計算に使える接続先の面がありません。")
+        self.mesh = trimesh.Trimesh(vertices, faces, process=False)
+
+    def distances(self, points):
+        normalized = (points - self.origin) / self.scale
+        result = np.empty(len(points))
+        # Limit the size of temporary triangle-candidate arrays on detailed meshes.
+        for start in range(0, len(points), 128):
+            _, distance, _ = trimesh.proximity.closest_point(self.mesh, normalized[start:start + 128])
+            result[start:start + 128] = distance * self.scale
+        if not np.isfinite(result).all():
+            raise ValueError("接続先の表面距離に不正な値があります。入力形状を確認してください。")
+        return result
+
+
+class _SurfaceQueries(dict):
+    def __init__(self, parts):
+        super().__init__()
+        self.parts = {part.part_id: part for part in parts}
+
+    def __missing__(self, part_id):
+        query = self[part_id] = _SurfaceDistanceQuery(self.parts[part_id])
+        return query
+
+
+def reference_distance_field(points, local_sources, part, source_owners, queries):
+    """Precompute surface distances and seam ownership independently of the band.
+
+    Edge-path distances select reference ownership and reachable components only.
+    The deformation falloff itself uses distance to the reference triangles.
+    """
+    node_for_local, node_index, graph = part_edge_graph(points, local_sources, part)
+    node_sources = np.unique(local_sources)
+    boundary = {node_index[source]: owner for source, owner in source_owners.items() if source in node_index}
+    if not boundary:
+        return None
+    references = sorted(set(boundary.values()))
+    paths = np.asarray([_distances(graph, [node for node, owner in boundary.items() if owner == reference])
+                        for reference in references])
+    nearest_path = paths.min(axis=0)
+    reachable = np.isfinite(nearest_path)
+    ownership = np.zeros_like(paths)
+    for row, path in enumerate(paths):
+        ownership[row, path == 0] = 1
+        valid = np.isfinite(path) & (path > 0) & (nearest_path > 0)
+        ownership[row, valid] = (nearest_path[valid] / path[valid]) ** 2
+    totals = ownership.sum(axis=0)
+    active = totals > 0
+    ownership[:, active] /= totals[active]
+
+    fields, nearest_surface = [], np.full(len(graph), np.inf)
+    for row, reference in enumerate(references):
+        if reference == part.part_id:
+            continue
+        distance = np.full(len(graph), np.inf)
+        fixed = paths[row] == 0
+        distance[fixed] = 0  # Pin every copy of the actual seam, without roundoff.
+        query_nodes = np.flatnonzero(np.isfinite(paths[row]) & ~fixed)
+        if len(query_nodes):
+            distance[query_nodes] = queries[reference].distances(points[node_sources[query_nodes]])
+        nearest_surface = np.minimum(nearest_surface, distance)
+        fields.append({"reference_part_id": reference, "distances": distance[node_for_local],
+                       "ownership": ownership[row, node_for_local]})
+    # Self-owned cuts retain this part's own transform. Other connected parts
+    # use that same transform as their reference at these cuts.
+    nearest_surface[list(boundary)] = 0
+    finite = np.isfinite(nearest_surface)
+    return {"part_id": part.part_id, "name": part.name, "references": fields,
+            "self_ownership": ownership[references.index(part.part_id), node_for_local] if part.part_id in references else np.zeros(len(local_sources)),
+            "distances": nearest_surface[node_for_local],
+            "depth": float(nearest_surface[finite].max()) if np.any(finite) else 0.,
+            "part_size": part_transition_size(part),
+            "boundary_vertices": int(np.count_nonzero(nearest_path[node_for_local] == 0)),
+            "unreachable_vertices": int(np.count_nonzero(~reachable[node_for_local]))}
+
+
 def boundary_anchor_samples(points, local_ids, connections):
     maps = {part: {int(source): int(index) for index, source in reversed(list(enumerate(ids)))} for part, ids in local_ids.items()}
     anchors = {}
@@ -93,18 +197,17 @@ def boundary_anchor_samples(points, local_ids, connections):
     return anchors
 
 
-def build_boundary_blend(content, manifest, parts, connections, selected_ids, ratio=0.2, root_id=None):
-    """Use exact seam correspondence and edge-path distances on the rest mesh.
+def build_blend_distances(content, manifest, parts, connections, selected_ids, root_id=None, connection_references=None):
+    """Build immutable distance fields on the original mesh, once per selection.
 
     Unselected incident parts supply boundary targets first; ties prefer the
     existing root, then part ID. Every copy at a contact uses the same target.
     """
     selected = set(selected_ids)
     by_id = {part.part_id: part for part in parts}
-    if (any(type(part) is not int or part not in by_id or not len(by_id[part].faces) for part in selected)
-            or type(ratio) not in (int, float) or not np.isfinite(ratio) or not 0 < ratio <= 1):
-        raise ValueError("境界なじませの対象パーツまたは範囲が不正です。")
-    payload = {"method": "boundary_blend_v1", "selected_ids": sorted(selected), "ratio": float(ratio),
+    if any(type(part) is not int or part not in by_id or not len(by_id[part].faces) for part in selected):
+        raise ValueError("境界なじませの対象パーツが不正です。")
+    payload = {"method": METHOD, "distance_basis": DISTANCE_BASIS, "range_basis": RANGE_BASIS, "selected_ids": sorted(selected),
                "parts": {}, "anchors": {}, "reference_checks": [], "warnings": []}
     if not selected:
         return payload
@@ -113,9 +216,15 @@ def build_boundary_blend(content, manifest, parts, connections, selected_ids, ra
     # Part-contact components at a source vertex avoid linking unrelated point
     # contacts. Only actual shared boundary edges create contact relationships.
     contacts = defaultdict(lambda: defaultdict(set))
+    explicit = defaultdict(set)
     for connection in connections:
         for edge in connection.boundary_edges:
             for vertex in edge:
+                if connection_references and connection.connection_id in connection_references:
+                    reference = connection_references[connection.connection_id]
+                    if reference not in (connection.part_a, connection.part_b):
+                        raise ValueError("なじませの基準側が接続に含まれていません。")
+                    explicit[vertex].add(reference)
                 contacts[vertex][connection.part_a].add(connection.part_b)
                 contacts[vertex][connection.part_b].add(connection.part_a)
     seeds = defaultdict(dict)
@@ -130,64 +239,64 @@ def build_boundary_blend(content, manifest, parts, connections, selected_ids, ra
                 component.add(part)
                 unseen.discard(part)
                 queue.extend(adjacency[part] - component)
-            reference = min(component, key=lambda part: (part in selected, part != root_id, part))
+            candidates = explicit[vertex] & component
+            reference = min(candidates or component, key=lambda part: (part in selected, part != root_id, part))
             for part in component:
                 seeds[part][vertex] = reference
             fixed = sorted(component - selected)
             if component & selected and len(fixed) > 1:
                 payload["reference_checks"].append({"point": points[vertex].tolist(), "part_ids": fixed})
 
+    queries = _SurfaceQueries(parts)
     for part_id in sorted(selected):
         part = by_id[part_id]
-        node_for_local, node_index, graph = part_edge_graph(points, local_ids[part_id], part)
-        boundary = {node_index[source]: reference for source, reference in seeds[part_id].items() if source in node_index}
-        if not boundary:
+        field = reference_distance_field(points, local_ids[part_id], part, seeds[part_id], queries)
+        if field is None:
             payload["warnings"].append(f"{part.name}: 対応する共有境界がないため、従来の変形を使います。")
             continue
-        nearest = _distances(graph, boundary)
-        finite = np.isfinite(nearest)
-        depth = float(nearest[finite].max())
-        radius = float(ratio * depth)
-        strength = np.zeros(len(graph))
-        if radius > 0:
-            t = np.minimum(nearest[finite] / radius, 1)
-            strength[finite] = 1 - t * t * (3 - 2 * t)
-        else:
-            strength[nearest == 0] = 1
-        references = sorted(set(boundary.values()))
-        kernels = np.zeros((len(references), len(graph)))
-        for row, reference in enumerate(references):
-            source_nodes = [node for node, owner in boundary.items() if owner == reference]
-            if len(references) == 1:
-                kernels[row, finite] = 1
-                continue
-            distances = _distances(graph, source_nodes, radius)
-            zero = distances == 0
-            valid = np.isfinite(distances) & (distances > 0) & (distances < radius) & (nearest > 0)
-            kernels[row, valid] = (nearest[valid] / distances[valid]) ** 2 * (1 - distances[valid] / radius) ** 2
-            kernels[row, zero] = 1
-        total = kernels.sum(axis=0)
-        active = total > 0
-        kernels[:, active] /= total[active]
-        influences = []
-        for reference, kernel in zip(references, kernels):
-            weights = strength * kernel
-            if reference != part_id and np.any(weights > 0):
-                influences.append({"reference_part_id": reference, "weights": weights[node_for_local].tolist()})
-        transition = finite & (nearest > 0) & (nearest < radius)
-        if influences and not np.any(transition):
-            payload["warnings"].append(f"{part.name}: 遷移帯に中間頂点がありません。範囲を広げるか、境界付近の細分化が必要です。")
-        if np.any(~finite):
-            payload["warnings"].append(f"{part.name}: 境界へ到達できない頂点は従来の変形を使います。")
-        payload["parts"][str(part_id)] = {"part_id": part_id, "influences": influences, "depth": depth,
-            "radius": radius, "boundary_vertices": int(np.count_nonzero(nearest[node_for_local] == 0)),
-            "transition_vertices": int(np.count_nonzero(transition[node_for_local])),
-            "unreachable_vertices": int(np.count_nonzero(~finite[node_for_local]))}
+        payload["parts"][str(part_id)] = field
 
-    # Weighted boundary-vertex samples make anchor diagnostics reflect the
-    # deformed geometry, rather than the old uniform-scale approximation.
     payload["anchors"] = boundary_anchor_samples(points, local_ids, connections)
     return payload
+
+
+def blend_weights(distances, ratio=DEFAULT_RATIO):
+    """Change the transition width without repeating any surface queries."""
+    if type(ratio) not in (int, float) or not np.isfinite(ratio) or not 0 < ratio <= 1:
+        raise ValueError("境界なじませの範囲が不正です。")
+    payload = {key: value for key, value in distances.items() if key not in {"parts", "warnings"}}
+    payload.update(ratio=float(ratio), parts={}, warnings=list(distances["warnings"]))
+    for part_id, field in distances["parts"].items():
+        radius = float(ratio * field["part_size"])
+        kernels = []
+        total = field["self_ownership"].copy()
+        strength = np.where(total > 0, 1., 0.)
+        for reference in field["references"]:
+            d = reference["distances"]
+            t = np.clip(d / radius, 0, 1) if radius > 0 else np.where(d == 0, 0., 1.)
+            falloff = 1 - t*t*(3 - 2*t)
+            kernel = falloff * reference["ownership"]
+            kernels.append(kernel)
+            total += kernel
+            strength = np.maximum(strength, falloff)
+        influences = []
+        for reference, kernel in zip(field["references"], kernels):
+            weights = np.divide(kernel * strength, total, out=np.zeros_like(total), where=total > 0)
+            if np.any(weights > 0):
+                influences.append({"reference_part_id": reference["reference_part_id"], "weights": weights.tolist()})
+        strength = np.sum([item["weights"] for item in influences], axis=0) if influences else np.zeros(len(field["distances"]))
+        transition = (strength > 0) & (strength < 1)
+        if influences and not np.any(transition):
+            payload["warnings"].append(f"{field['name']}: 遷移帯に中間頂点がありません。範囲を広げるか、境界付近の細分化が必要です。")
+        if field["unreachable_vertices"]:
+            payload["warnings"].append(f"{field['name']}: 境界へ到達できない頂点は従来の変形を使います。")
+        payload["parts"][part_id] = {key: field[key] for key in ("part_id", "depth", "part_size", "boundary_vertices", "unreachable_vertices")}
+        payload["parts"][part_id].update(influences=influences, radius=radius, transition_vertices=int(np.count_nonzero(transition)))
+    return payload
+
+
+def build_boundary_blend(content, manifest, parts, connections, selected_ids, ratio=DEFAULT_RATIO, root_id=None, connection_references=None):
+    return blend_weights(build_blend_distances(content, manifest, parts, connections, selected_ids, root_id, connection_references), ratio)
 
 
 def apply_boundary_blend(parts, baseline, scales, automatic, payload):
@@ -229,6 +338,6 @@ def blend_metadata(payload, parts, scales, automatic):
             point = np.asarray(check["point"])
             targets.append(point + (scales[str(part_id)] - 1) * (point - part.center) + automatic[part_id])
         conflicts += any(np.linalg.norm(point - targets[0]) > tolerance for point in targets[1:])
-    return {"method": payload["method"], "selected_ids": payload["selected_ids"], "ratio": payload["ratio"],
+    return {"method": payload["method"], "distance_basis": payload["distance_basis"], "range_basis": payload["range_basis"], "selected_ids": payload["selected_ids"], "ratio": payload["ratio"],
             "parts": [{key: value for key, value in item.items() if key != "influences"} for item in payload["parts"].values()],
             "conflicting_fixed_vertices": conflicts}

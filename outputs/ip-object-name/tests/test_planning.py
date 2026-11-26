@@ -27,6 +27,9 @@ def prediction():
             {"name": "head", "label": "\u5148\u7aef", "description": "the working region", "is_edit_target": False},
         ],
         "warnings": [],
+        "base_part": "head",
+        "connections": [{"parent": "head", "child": "handle", "relationship": "attachment", "mode": "cap_union",
+                         "reference_part": "head", "deform_part": "handle", "reason": "持ち手を独立して編集するため。"}],
     })
 
 
@@ -72,6 +75,8 @@ class PlanningTests(unittest.TestCase):
         result = response.json()
         self.assertEqual(result["model_id"], model["model_id"])
         self.assertEqual(result["part_names"], ["handle", "head"])
+        self.assertEqual(result["editing_policy"]["base_part_id"], 1)
+        self.assertEqual(result["editing_policy"]["relations"][0]["deform_part_id"], 0)
         self.assertEqual([p["part_id"] for p in result["parts"]], [0, 1])
         self.assertEqual(result["input_mesh"], model["input_mesh"])
         self.assertEqual(result["returned_model_version"], "reported-model-version")
@@ -159,7 +164,7 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(returned_version, "provider-version")
         self.assertEqual(result.parts[0].name, "handle")
 
-    def test_sdk_wire_schema_omits_unsupported_additional_properties(self):
+    def test_sdk_wire_schema_omits_unsupported_keywords_and_array_length_constraints(self):
         from google import genai
         from google.genai import types
 
@@ -169,9 +174,9 @@ class PlanningTests(unittest.TestCase):
             body = json.loads(request.content)
             requests.append(body)
             schema = body["generationConfig"]["responseSchema"]
-            for keyword in ("additional_properties", "additionalProperties"):
+            for keyword in ("additional_properties", "additionalProperties", "minItems", "maxItems", "min_items", "max_items"):
                 self.assertNotIn(keyword, json.dumps(schema))
-            self.assertEqual(set(schema["required"]), {"summary", "parts", "warnings"})
+            self.assertEqual(set(schema["required"]), {"summary", "parts", "warnings", "base_part", "connections"})
             self.assertEqual(set(schema["properties"]["parts"]["items"]["required"]), {"name", "label", "description", "is_edit_target"})
             return httpx.Response(200, json={
                 "candidates": [{"content": {"role": "model", "parts": [{"text": prediction().model_dump_json()}]}, "finishReason": "STOP"}],
@@ -193,6 +198,77 @@ class PlanningTests(unittest.TestCase):
                 target["unexpected"] = "not allowed"
                 with self.assertRaises(ValidationError):
                     PartPlanPrediction.model_validate(value)
+
+    def test_local_validation_keeps_array_limits_after_wire_schema_is_simplified(self):
+        for field, items in (("parts", []), ("parts", [{}] * 33),
+                             ("warnings", ["warning"] * 11), ("connections", [{}] * 65)):
+            with self.subTest(field=field, count=len(items)):
+                value = prediction().model_dump()
+                value[field] = items
+                with self.assertRaises(ValidationError) as caught:
+                    PartPlanPrediction.model_validate(value)
+                self.assertTrue(any(error["loc"] == (field,) and error["type"] in {"too_short", "too_long"}
+                                    for error in caught.exception.errors()))
+
+    def test_oversized_provider_reply_is_rejected_locally_without_an_extra_api_call(self):
+        value = prediction().model_dump()
+        value["warnings"] = ["warning"] * 11
+        client = MagicMock()
+        client.models.generate_content.return_value = SimpleNamespace(text=json.dumps(value))
+        with patch("google.genai.Client") as constructor, patch("ip_object_name.core._api_key", return_value="test-key"):
+            constructor.return_value.__enter__.return_value = client
+            with self.assertRaises(core.VLMError):
+                request_part_plan("wrench", "edit", model="selected-model")
+        client.models.generate_content.assert_called_once()
+
+    def test_editing_policy_rejects_unknown_conflicting_duplicate_and_cyclic_links(self):
+        for mutate in (
+            lambda p: p.update(base_part="missing"),
+            lambda p: p["connections"][0].update(child="missing"),
+            lambda p: p["connections"][0].update(reference_part="handle", deform_part="handle"),
+            lambda p: p["connections"][0].update(mode="blend"),
+            lambda p: p["connections"].append(p["connections"][0].copy()),
+            lambda p: p["connections"][0].update(parent="handle", child="head"),
+        ):
+            value = prediction().model_dump()
+            mutate(value)
+            with self.assertRaises(ValidationError):
+                PartPlanPrediction.model_validate(value)
+
+    def test_continuous_relation_can_reference_the_unedited_child(self):
+        value = prediction().model_dump()
+        value["connections"][0].update(relationship="continuous", mode="blend", reference_part="handle", deform_part="head")
+        policy = PartPlanPrediction.model_validate(value).editing_policy()
+        self.assertEqual(policy["base_part_id"], 1)
+        self.assertEqual(policy["relations"][0]["reference_part_id"], 0)
+        self.assertEqual(policy["relations"][0]["deform_part_id"], 1)
+
+    def test_cycles_outside_the_base_and_multiple_parents_are_rejected(self):
+        value = prediction().model_dump()
+        value['parts'].append({**value['parts'][0], 'name': 'tip'})
+        link = value['connections'][0]
+        value['connections'] = [
+            {**link, 'parent':'handle', 'child':'tip', 'reference_part':'handle', 'deform_part':'tip'},
+            {**link, 'parent':'tip', 'child':'handle', 'reference_part':'tip', 'deform_part':'handle'}]
+        with self.assertRaises(ValidationError):
+            PartPlanPrediction.model_validate(value)
+        value['connections'][1].update(parent='head', child='tip', reference_part='head', deform_part='tip')
+        with self.assertRaises(ValidationError):
+            PartPlanPrediction.model_validate(value)
+
+    def test_new_provider_reply_requires_policy_and_whole_object_has_no_links(self):
+        value = prediction().model_dump()
+        del value["base_part"]
+        del value["connections"]
+        client = MagicMock()
+        client.models.generate_content.return_value = SimpleNamespace(text=json.dumps(value))
+        with patch("google.genai.Client") as constructor, patch("ip_object_name.core._api_key", return_value="test-key"):
+            constructor.return_value.__enter__.return_value = client
+            with self.assertRaises(core.VLMError):
+                request_part_plan("wrench", "edit", model="selected-model")
+        value["parts"] = [value["parts"][0]]
+        value.update(base_part="handle", connections=[])
+        self.assertEqual(PartPlanPrediction.model_validate(value).editing_policy()["relations"], [])
 
 
 if __name__ == "__main__":

@@ -197,6 +197,8 @@ def export_partition(partition: MeshPartition, plan: dict, run_dir: Path, segmen
         "full_face_coverage": True, "diagnostics": partition.diagnostics,
         "appearance": "semantic colors; original textures are not copied",
     }
+    if plan.get("editing_policy") is not None:
+        manifest["editing_policy"] = plan["editing_policy"]
     run_dir.mkdir(parents=True, exist_ok=True)
     scene.export(run_dir / "parts.glb", file_type="glb")
     np.savez_compressed(run_dir / "parts.npz", **arrays)

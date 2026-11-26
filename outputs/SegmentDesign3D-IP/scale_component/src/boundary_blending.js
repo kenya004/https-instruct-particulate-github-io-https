@@ -22,7 +22,7 @@ export function blendedPoint(part, index, transforms, spec) {
   return result;
 }
 
-export function writeBlendedPositions(part, transforms, spec, output, offset = [0, 0, 0], motion = null) {
+export function writeBlendedPositions(part, transforms, spec, output, offset = [0, 0, 0], motion = null, allOffsets = {}) {
   const own = transforms[String(part.part_id)];
   // Write local coordinates directly; no temporary vectors per vertex.
   for (let index = 0; index < part.vertices.length; index += 1) {
@@ -35,6 +35,9 @@ export function writeBlendedPositions(part, transforms, spec, output, offset = [
         value += influence.weights[index] * (reference.scale * point[axis] + reference.shift[axis] - baseline);
       }
       output[index * 3 + axis] = value + (motion?.weights[index] ?? 1) * offset[axis] - part.center[axis];
+      for (const reference of motion?.reference_influences ?? []) {
+        output[index * 3 + axis] += reference.weights[index] * (allOffsets[String(reference.reference_part_id)]?.[axis] ?? 0);
+      }
     }
   }
 }
@@ -46,6 +49,9 @@ export function sampledAnchor(sample, byId, transforms, blending, offsets, motio
   for (const [index, vertex] of sample.indices.entries()) {
     const point = blendedPoint(part, vertex, transforms, blending.parts[String(part.part_id)]);
     for (let axis = 0; axis < 3; axis += 1) result[axis] += sample.weights[index] * point[axis];
+    for (const reference of spec?.reference_influences ?? []) {
+      for (let axis = 0; axis < 3; axis += 1) result[axis] += sample.weights[index] * reference.weights[vertex] * offsets[String(reference.reference_part_id)][axis];
+    }
     manualWeight += sample.weights[index] * (spec?.weights[vertex] ?? 1);
   }
   return result.map((value, axis) => value + (spec ? manualWeight : 1) * offsets[String(part.part_id)][axis]);

@@ -143,6 +143,11 @@ def _validate_mesh(vertices, faces):
             "volume": volume, "degenerate_faces": 0, "self_intersection_pair_count": 0}
 
 
+def validate_solid(vertices, faces):
+    """Inspect a welded result using the same checks as Boolean/STL output."""
+    return _validate_mesh(vertices, faces)
+
+
 def _engine_status(solid, engine):
     if solid.status() != engine.Error.NoError:
         raise ValueError("結合エンジンが形状を処理できませんでした。閉じた面と面の向きを確認してください。")

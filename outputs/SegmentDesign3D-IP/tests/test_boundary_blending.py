@@ -58,13 +58,14 @@ class BoundaryBlendingTests(unittest.TestCase):
         self.field = build_boundary_blend(self.content, self.manifest, self.parts, self.connections, [1], root_id=0)
         self.scales = {"0": 1, "1": 2}
 
-    def test_twenty_percent_band_matches_boundary_and_preserves_full_interior_scale(self):
+    def test_sixty_percent_band_matches_boundary_and_preserves_full_interior_scale(self):
         field = self.field["parts"]["1"]
         self.assertAlmostEqual(field["depth"], 10)
-        self.assertAlmostEqual(field["radius"], 2)
+        self.assertAlmostEqual(field["part_size"], 10)
+        self.assertAlmostEqual(field["radius"], 6)
         edited, base, _ = evaluate(self.parts, self.connections, self.field, self.scales)
         part = self.parts[1]
-        seam, middle, outside = [np.isclose(part.vertices[:, 0], x) for x in (11, 12, 14)]
+        seam, middle, outside = [np.isclose(part.vertices[:, 0], x) for x in (11, 14, 18)]
         np.testing.assert_allclose(edited[1].vertices[seam], part.vertices[seam])
         np.testing.assert_allclose(edited[1].vertices[middle], .5 * (part.vertices[middle] + base[1].vertices[middle]))
         np.testing.assert_allclose(edited[1].vertices[outside], base[1].vertices[outside])
@@ -73,6 +74,22 @@ class BoundaryBlendingTests(unittest.TestCase):
             np.testing.assert_array_equal(changed.faces, original.faces)
             self.assertEqual(changed.vertices.shape, original.vertices.shape)
             self.assertFalse(original.vertices.flags.writeable)
+
+    def test_cut_count_keeps_transition_width_and_equal_distances_keep_equal_strength(self):
+        manifest, artifacts, parts, connections = dense_fixture(three=True)
+        content = artifacts["parts.npz"]
+        one_cut = build_boundary_blend(content, manifest, parts, connections[:1], [1], root_id=0)
+        two_cuts = build_boundary_blend(content, manifest, parts, connections, [1], root_id=0)
+        single, multiple = one_cut["parts"]["1"], two_cuts["parts"]["1"]
+        self.assertAlmostEqual(single["depth"], 10)
+        self.assertAlmostEqual(multiple["depth"], 5)
+        self.assertAlmostEqual(single["radius"], multiple["radius"])
+        self.assertAlmostEqual(multiple["radius"], 6)
+        strengths = np.sum([influence["weights"] for influence in multiple["influences"]], axis=0)
+        # One unit inward from either end must receive the same total strength.
+        near_each_cut = np.isclose(parts[1].vertices[:, 0], 12) | np.isclose(parts[1].vertices[:, 0], 20)
+        t = 1 / 6
+        np.testing.assert_allclose(strengths[near_each_cut], 1 - (3*t*t - 2*t*t*t))
 
     def test_follow_disabled_still_matches_target_and_manual_motion_remains_independent(self):
         edited, _, automatic = evaluate(self.parts, self.connections, self.field, self.scales, follow=False)
@@ -127,7 +144,7 @@ class BoundaryBlendingTests(unittest.TestCase):
         manifest, artifacts = connection_fixture(2)
         parts = load_editable_parts(artifacts["parts.npz"], manifest)
         connections, _ = detect_connections(artifacts["parts.npz"], parts)
-        coarse = build_boundary_blend(artifacts["parts.npz"], manifest, parts, connections, [1])
+        coarse = build_boundary_blend(artifacts["parts.npz"], manifest, parts, connections, [1], .1)
         self.assertTrue(any("中間頂点" in warning for warning in coarse["warnings"]))
 
     def test_export_rejoin_and_cache_identity_include_blending(self):
@@ -173,7 +190,7 @@ class BoundaryBlendingTests(unittest.TestCase):
 
 
 class BoundaryBlendingInterfaceTests(unittest.TestCase):
-    def test_select_parts_twenty_percent_default_rejoin_and_config_changes(self):
+    def test_select_parts_sixty_percent_default_rejoin_and_config_changes(self):
         manifest, artifacts, parts, _ = dense_fixture()
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
         app.get("file_uploader")[0].set_value(("input.glb", artifacts["parts.glb"], "model/gltf-binary")).run()
@@ -187,7 +204,7 @@ class BoundaryBlendingInterfaceTests(unittest.TestCase):
         self.assertEqual([item.value for item in app.error], [])
         key = app.session_state["part_editing"]["source_key"]
         target_key, range_key = f"boundary_blend_parts_{key}", f"boundary_blend_range_{key}"
-        self.assertEqual(app.slider(key=range_key).value, 20)
+        self.assertEqual(app.slider(key=range_key).value, 60)
         self.assertTrue(app.slider(key=range_key).disabled)
         self.assertIn("middle section (ID 1)", app.multiselect(key=target_key).options)
         app.multiselect(key=target_key).set_value([1]).run()
@@ -197,7 +214,7 @@ class BoundaryBlendingInterfaceTests(unittest.TestCase):
             app.run()
         state = app.session_state["part_editing"]
         self.assertEqual(state["connections"]["boundary_blending"]["selected_ids"], [1])
-        self.assertAlmostEqual(state["connections"]["boundary_blending"]["ratio"], .2)
+        self.assertAlmostEqual(state["connections"]["boundary_blending"]["ratio"], .6)
         seam = np.isclose(parts[1].vertices[:, 0], 11)
         np.testing.assert_allclose(state["edited_parts"][1].vertices[seam], parts[1].vertices[seam])
         app.button(key="rejoin_mesh").click().run()

@@ -116,7 +116,7 @@ def detect_connections(content: bytes, parts: tuple[EditablePart, ...]) -> tuple
     return tuple(connections), warnings
 
 
-def build_connection_plan(parts: tuple[EditablePart, ...], connections: tuple[Connection, ...], root_id: int) -> ConnectionPlan:
+def build_connection_plan(parts: tuple[EditablePart, ...], connections: tuple[Connection, ...], root_id: int, preferred_relations=()) -> ConnectionPlan:
     ids = sorted(part.part_id for part in parts if len(part.faces))
     if root_id not in ids:
         raise ValueError("基準パーツには面のあるパーツを指定してください。")
@@ -124,7 +124,10 @@ def build_connection_plan(parts: tuple[EditablePart, ...], connections: tuple[Co
     adjacency = defaultdict(list)
     unused = []
     # Prefer substantial boundaries; each additional constraint in a cycle is reported.
-    for connection in sorted(connections, key=lambda item: (-item.boundary_length, item.connection_id)):
+    preferred = {frozenset((r["parent_id"], r["child_id"])) for r in preferred_relations}
+    children = {r["child_id"] for r in preferred_relations}
+    preferred_roots = sorted({r["parent_id"] for r in preferred_relations} - children)
+    for connection in sorted(connections, key=lambda item: (frozenset((item.part_a, item.part_b)) not in preferred, -item.boundary_length, item.connection_id)):
         if connection.part_a not in groups.parent or connection.part_b not in groups.parent:
             raise ValueError("接続先のパーツが存在しません。")
         if groups.join(connection.part_a, connection.part_b):
@@ -133,7 +136,7 @@ def build_connection_plan(parts: tuple[EditablePart, ...], connections: tuple[Co
         else:
             unused.append(connection.connection_id)
     visited, roots, attachments = set(), [], []
-    for root in [root_id] + [index for index in ids if index != root_id]:
+    for root in [root_id] + [i for i in preferred_roots if i in ids and i != root_id] + [index for index in ids if index != root_id]:
         if root in visited:
             continue
         roots.append(root)

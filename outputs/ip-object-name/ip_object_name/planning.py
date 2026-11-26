@@ -5,6 +5,7 @@ import json
 from importlib.metadata import version
 from pathlib import Path
 from uuid import uuid4
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -28,18 +29,67 @@ class PlannedRegion(BaseModel):
         return value
 
 
+class PlannedConnection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    parent: str = Field(min_length=1, max_length=80)
+    child: str = Field(min_length=1, max_length=80)
+    relationship: Literal["attachment", "continuous"]
+    mode: Literal["cap_union", "blend"]
+    reference_part: str = Field(min_length=1, max_length=80)
+    deform_part: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=1, max_length=400)
+
+
 class PartPlanPrediction(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     summary: str = Field(min_length=1, max_length=600)
     parts: list[PlannedRegion] = Field(min_length=1, max_length=32)
     warnings: list[str] = Field(max_length=10)
+    # Defaults allow reading earlier saved plans. New provider replies require both.
+    base_part: str | None = None
+    connections: list[PlannedConnection] | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def distinct_names(self):
         names = [part.name.casefold() for part in self.parts]
         if len(set(names)) != len(names):
             raise ValueError("Part names must be distinct.")
+        if self.base_part is None and self.connections is None:
+            return self
+        known = {part.name for part in self.parts}
+        if self.base_part not in known or self.connections is None:
+            raise ValueError("Specify a known base part and its connection policy.")
+        parents, pairs = {}, set()
+        for link in self.connections:
+            if not {link.parent, link.child, link.reference_part, link.deform_part}.issubset(known):
+                raise ValueError("Connection references an unknown part.")
+            pair = frozenset((link.parent, link.child))
+            if len(pair) != 2 or pair in pairs or {link.reference_part, link.deform_part} != pair:
+                raise ValueError("Connection endpoints, reference or deformation side are invalid.")
+            if (link.relationship == "continuous") != (link.mode == "blend"):
+                raise ValueError("Continuous relations use blend; attachments use cap_union.")
+            if link.child == self.base_part or link.child in parents:
+                raise ValueError("The base cannot be a child; each part has at most one structural parent.")
+            pairs.add(pair)
+            parents[link.child] = link.parent
+        for name in known:
+            seen = set()
+            while name in parents:
+                if name in seen:
+                    raise ValueError("Attachment relationships must not contain a cycle.")
+                seen.add(name)
+                name = parents[name]
         return self
+
+    def editing_policy(self):
+        if self.base_part is None:
+            return None
+        ids = {part.name: i for i, part in enumerate(self.parts)}
+        return {"version": 1, "source": "part_planner_text", "base_part_id": ids[self.base_part],
+            "relations": [{"parent_id": ids[r.parent], "child_id": ids[r.child],
+                "relationship": r.relationship, "mode": r.mode,
+                "reference_part_id": ids[r.reference_part], "deform_part_id": ids[r.deform_part],
+                "reason": r.reason} for r in self.connections]}
 
 
 def normalize_edit_request(value: str) -> str:
@@ -50,13 +100,15 @@ def normalize_edit_request(value: str) -> str:
 
 
 def _part_plan_response_schema() -> dict:
-    # Keep the API schema separate from strict local Pydantic validation.
+    # Keep array lengths out of Gemini's decoding schema. Bounded arrays of
+    # multi-field objects can exceed the provider's constraint-state budget.
+    # The prompt requests the limits; PartPlanPrediction enforces them locally.
     return {
         "type": "OBJECT",
         "properties": {
             "summary": {"type": "STRING"},
             "parts": {
-                "type": "ARRAY", "minItems": 1, "maxItems": 32,
+                "type": "ARRAY",
                 "items": {
                     "type": "OBJECT",
                     "properties": {
@@ -68,9 +120,17 @@ def _part_plan_response_schema() -> dict:
                     "required": ["name", "label", "description", "is_edit_target"],
                 },
             },
-            "warnings": {"type": "ARRAY", "maxItems": 10, "items": {"type": "STRING"}},
+            "warnings": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "base_part": {"type": "STRING"},
+            "connections": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+                "parent": {"type": "STRING"}, "child": {"type": "STRING"},
+                "relationship": {"type": "STRING", "enum": ["attachment", "continuous"]},
+                "mode": {"type": "STRING", "enum": ["cap_union", "blend"]},
+                "reference_part": {"type": "STRING"}, "deform_part": {"type": "STRING"},
+                "reason": {"type": "STRING"}},
+                "required": ["parent", "child", "relationship", "mode", "reference_part", "deform_part", "reason"]}},
         },
-        "required": ["summary", "parts", "warnings"],
+        "required": ["summary", "parts", "warnings", "base_part", "connections"],
     }
 
 
@@ -97,6 +157,8 @@ def request_part_plan(object_name: str, edit_request: str, *, model: str) -> tup
         raise core.VLMError("Part-list generation failed. Check model access, network, and quota.") from error
     try:
         prediction = PartPlanPrediction.model_validate_json(response.text)
+        if prediction.base_part is None or prediction.connections is None:
+            raise ValueError("The LLM omitted the editing policy.")
     except (TypeError, ValueError, ValidationError) as error:
         raise core.VLMError("The LLM returned an invalid part list.") from error
     return prediction, getattr(response, "model_version", None)
@@ -132,6 +194,7 @@ def plan_registered_model(store: ModelStore, model_id: str, edit_request: str, *
             "summary": prediction.summary, "warnings": prediction.warnings,
             "parts": [{"part_id": index, **part.model_dump()} for index, part in enumerate(prediction.parts)],
             "part_names": [part.name for part in prediction.parts],
+            "editing_policy": prediction.editing_policy(),
             "input_mesh": metadata["input_mesh"], "source_sha256": metadata["source_sha256"],
             "input_sha256": metadata.get("input_sha256", metadata["source_sha256"]),
             "up_dir": metadata["up_dir"], "orientation": metadata.get("orientation"),

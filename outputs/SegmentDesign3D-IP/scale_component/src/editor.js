@@ -214,7 +214,7 @@ function updatePreview() {
     const id = String(part.part_id), spec = blending.parts[id], motion = boundaryMotion.parts[id];
     if (spec || motion) {
       const positions = mesh.geometry.getAttribute("position");
-      writeBlendedPositions(part, transforms, spec ?? {influences: []}, positions.array, offsets[id], motion);
+      writeBlendedPositions(part, transforms, spec ?? {influences: []}, positions.array, offsets[id], motion, offsets);
       positions.needsUpdate = true;
       mesh.geometry.computeVertexNormals();
       mesh.geometry.computeBoundingBox();

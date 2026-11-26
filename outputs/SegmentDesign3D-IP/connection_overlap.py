@@ -66,7 +66,7 @@ def closed_context(closed, original, *, depth_ratio=DEPTH_RATIO, max_extension_r
 
 
 def connections_from_closed(content, manifest, original, closed, plan, *, depth_ratio=DEPTH_RATIO,
-                            max_extension_ratio=None, allow_intersections=False):
+                            max_extension_ratio=None, allow_intersections=False, role_overrides=()):
     """Build extension correspondence from the saved caps without capping again."""
     try:
         import rtree  # Spatial queries used when checking the closed receiving part.
@@ -88,6 +88,12 @@ def connections_from_closed(content, manifest, original, closed, plan, *, depth_
     local_sources, _, _, _, _ = _source_cut_data(content, manifest, original)
     records = {p.part.part_id: p for p in closed.parts}
     roles = _roles(plan)
+    for relation in role_overrides:
+        pair = frozenset((relation["parent_id"], relation["child_id"]))
+        reference, deform = relation["reference_part_id"], relation["deform_part_id"]
+        if pair not in roles or len(pair) != 2 or {reference, deform} != pair:
+            raise ValueError("延長の基準側・変形側が接続と一致しません。")
+        roles[pair] = (reference, deform)
     regions = []
     for record in closed.parts:
         child = record.part.part_id
@@ -141,13 +147,23 @@ def pose_closed(context, offsets, motion):
         weights = np.asarray(spec["weights"]) if spec else np.ones(count)
         vertices = part.vertices.copy()
         vertices[:count] += weights[:, None] * delta
-        # Every boundary of fixed-boundary motion has weight zero. Whole-part
-        # translations move generated cap vertices by precisely the same delta.
+        if spec:
+            for reference in spec.get("reference_influences", []):
+                vertices[:count] += np.asarray(reference["weights"])[:, None] * np.asarray(offsets[str(reference["reference_part_id"])])
+        # Whole-part translations move generated cap vertices by the same delta.
+        # Policy-based motion may instead follow a different reference per cut.
         generated_delta = np.zeros(3) if spec else delta
         vertices[count:] += generated_delta
         for section in stats["sections"]:
             info = section["triangulation"]
             if "center_vertex" in info:
+                if spec:
+                    ring = np.asarray(section["boundary_loops"][0])
+                    points = vertices[ring]
+                    other = np.roll(points, -1, axis=0)
+                    lengths = np.linalg.norm(other - points, axis=1)
+                    vertices[info["center_vertex"]] = (np.average((points + other) / 2, axis=0, weights=lengths)
+                        if lengths.sum() > 0 else points[0])
                 info["center"] = vertices[info["center_vertex"]].tolist()
         records.append(replace(record, part=replace(part, vertices=vertices), statistics=stats))
     return CappingResult(tuple(records), {**context.base.statistics, "parts": [p.statistics for p in records]})
